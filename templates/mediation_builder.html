@@ -16,13 +16,18 @@
 
 <div class="builder-grid">
   <div>
+    <fieldset class="builder-step" id="account-step" style="display:none">
+      <legend><span class="num">00</span> AdMob Account</legend>
+      <input type="text" id="account-search" placeholder="Search accounts…" />
+      <div id="account-list" class="country-chips" style="margin-top:8px"></div>
+      <p class="muted small">Choose one or more AdMob accounts — only their apps appear below. To add a new account: sign into it on admob.google.com → <a href="/apps">Sync</a>.</p>
+    </fieldset>
+
     <fieldset class="builder-step">
       <legend><span class="num">01</span> Select App</legend>
+      <input type="text" id="app-search" placeholder="Search apps by name or ID…" style="margin-bottom:8px" />
       <select id="app-select">
         <option value="">— Choose an app —</option>
-        {% for a in apps %}
-          <option value="{{ a.id }}" data-platform="{{ a.platform }}">{{ a.name or a.app_id }} · {{ a.platform }} · {{ a.app_id }}</option>
-        {% endfor %}
       </select>
     </fieldset>
 
@@ -54,29 +59,26 @@
     </fieldset>
 
     <fieldset class="builder-step">
-      <legend><span class="num">04</span> Waterfall Depth &amp; Bidding</legend>
+      <legend><span class="num">04</span> Waterfall &amp; Bidding</legend>
       <div class="grid grid-2">
-        <label><span class="lbl">Number of tiers (1–{{ max_lines }})</span>
+        <label><span class="lbl">Number of waterfall lines (1–{{ max_lines }})</span>
           <input type="number" id="line-count" min="1" max="{{ max_lines }}" value="{{ default_lines }}" /></label>
-        <label><span class="lbl">Floor type (recorded locally)</span>
-          <select id="floor-type">
-            {% for f in floor_types %}<option value="{{ f }}">{{ f.replace("_"," ").title() }}</option>{% endfor %}
-          </select></label>
+        <label><span class="lbl">Group name prefix</span>
+          <input type="text" id="name-prefix" value="Global" /></label>
       </div>
-      <label class="check-row"><input type="checkbox" id="unique-names" checked /> Append random suffix to tier names</label>
-      <label class="check-row"><input type="checkbox" id="use-internal-api" /> <span><b>AdMob internal API</b> — create real AdMob Network <b>waterfall</b> lines on the backend (uses your saved AdMob session)</span></label>
-      <div id="internal-api-panel" style="display:none; margin-top:8px; padding:10px; border:1px solid var(--line); border-radius:8px">
-        <div class="small" id="session-status" style="margin-bottom:6px"></div>
-        <p class="muted small" style="margin:0 0 6px">Paste your AdMob cURL <b>once</b> — flow.py stores it encrypted and reuses it on every run. To get it: open <b>admob.google.com</b> → <b>F12</b> → <b>Network</b> tab → click any request whose URL contains <b>/rpc/</b> → right-click → Copy → <b>Copy as cURL (bash)</b>.</p>
-        <textarea id="session-curl" rows="4" spellcheck="false" placeholder="curl 'https://admob.google.com/v2/...rpc...' -H '...' -b '...'" style="width:100%; font-family:monospace; font-size:11px"></textarea>
-        <div style="margin-top:6px"><button type="button" class="btn-primary btn-sm" id="save-session-btn">Save AdMob session</button></div>
+
+      <div class="bidding-callout" id="bidding-callout">
+        <div class="bidding-callout-head">
+          <div>
+            <strong>⚡ Include All Bidding Networks</strong>
+            <p class="muted small" style="margin:4px 0 0">When ON, all enabled 3P bidding networks saved on <a href="/bidding">/bidding</a> (for this app + format) become LIVE bidding lines in the mediation group. When OFF, only the default AdMob Network LIVE line is added.</p>
+          </div>
+          <label class="bidding-toggle">
+            <input type="checkbox" id="include-bidding" checked />
+            <span class="bidding-slider"></span>
+          </label>
+        </div>
       </div>
-      <div class="muted small" style="padding:6px 0">AdMob Network only mode — creates tier ad units + a mediation group with MANUAL AdMob Network waterfall lines + AdMob Network LIVE bidding line. No 3P bidding networks.</div>
-      <div class="default-network-note">
-        <strong>⚡ AdMob Network is always present.</strong> Every mediation group has N MANUAL AdMob Network waterfall lines (one per tier eCPM) plus an explicit AdMob Network LIVE bidding line. Third-party bidding networks are added when /networks credentials exist for them.
-      </div>
-      <label class="check-row"><span class="lbl">Name prefix</span>
-        <input type="text" id="name-prefix" value="Global" /></label>
     </fieldset>
 
     <div class="form-actions">
@@ -99,19 +101,16 @@
   <p class="muted small" id="report-date-range"></p>
   <div id="report-cards"></div>
   <div class="calc-explainer">
-    <strong>Waterfall Formula:</strong>
-    Line 1 = avg eCPM × <span class="mono">{{ top_mult }}</span>,
-    then each next line = previous × <span class="mono">{{ step_factor }}</span>.
+    <strong>Waterfall Formula:</strong> Each tier = <span class="mono">Base eCPM × Vx multiplier</span>. Base = 7-day average eCPM.
+    <br>
+    <span class="muted small mono">V1 × {{ tier_multipliers[0] }} (top) · V2 × {{ tier_multipliers[1] }} · V3 × {{ tier_multipliers[2] }} · V4 × {{ tier_multipliers[3] }} · V5 × {{ tier_multipliers[4] }} · V6 × {{ tier_multipliers[5] }} · V7 × {{ tier_multipliers[6] }} · V8 × {{ tier_multipliers[7] }} · V9 × {{ tier_multipliers[8] }} · V10 × {{ tier_multipliers[9] }} (bottom)</span>
+    <br>
+    <span class="muted small">Every tier value is clamped to <b>${{ min_ecpm }}</b> – <b>${{ max_ecpm|int }}</b>.</span>
   </div>
   <div class="form-actions">
     <button class="btn-primary btn-lg" id="push-btn">▶ Create mediation group + waterfall + bidding</button>
     <button class="btn-secondary btn-lg" id="generate-btn">Save locally only (preview/draft)</button>
   </div>
-
-  <div class="form-actions" id="internal-actions" style="display:none">
-    <button class="btn-primary btn-lg" id="internal-push-btn">▶ Create real AdMob Network waterfall (internal API)</button>
-  </div>
-  <div id="internal-result" class="muted small" style="display:none; white-space:pre-wrap; margin-top:10px; font-family:monospace; background:rgba(0,0,0,0.04); padding:10px; border-radius:8px"></div>
 
   <hr style="margin: 32px 0; border: 0; border-top: 1px solid var(--line)" />
 
@@ -146,8 +145,8 @@ const COUNTRIES = {{ countries|tojson }};
 const MAX_LINES = {{ max_lines }};
 const DEFAULT_LINES = {{ default_lines }};
 const EXISTING_GROUPS = {{ existing_groups|tojson }};
-const ADMOB_SESSION_SAVED = {{ 'true' if admob_session_saved else 'false' }};
-const ADMOB_SESSION_AT = "{{ admob_session_at }}";
+const ALL_APPS = {{ all_apps|tojson }};
+const ACCOUNTS = {{ accounts|tojson }};
 
 const $ = sel => document.querySelector(sel);
 const $$ = sel => [...document.querySelectorAll(sel)];
@@ -158,13 +157,25 @@ const state = {
   country_mode: "GLOBAL",
   countries: new Set(),
   line_count: DEFAULT_LINES,
-  floor_type: "{{ floor_types[0] }}",
+  floor_type: "ALL_PRICES",
   unique_names: true,
-  include_bidding_networks: false,
-  use_internal_api: false,
+  include_bidding_networks: true,
   name_prefix: "Global",
   report: null,
 };
+
+// Wire the "Include All Bidding Networks" toggle (default ON).
+const __incBidCb = document.getElementById("include-bidding");
+if (__incBidCb) {
+  __incBidCb.addEventListener("change", e => {
+    state.include_bidding_networks = e.target.checked;
+    const callout = document.getElementById("bidding-callout");
+    if (callout) callout.classList.toggle("is-on", e.target.checked);
+  });
+  // Initial visual state
+  const callout = document.getElementById("bidding-callout");
+  if (callout) callout.classList.toggle("is-on", __incBidCb.checked);
+}
 
 function updatePreview() {
   const el = $("#preview-summary");
@@ -233,6 +244,67 @@ function renderCountries() {
   });
 }
 
+// ---- AdMob account selector + per-account app filtering (with search) ----
+let selectedAccounts = new Set();
+(function initAccounts(){
+  try { (JSON.parse(localStorage.getItem("selectedPublishers")||"[]")||[]).forEach(p=>selectedAccounts.add(p)); } catch(e){}
+  const valid = new Set(ACCOUNTS.map(a=>a.publisher));
+  selectedAccounts = new Set([...selectedAccounts].filter(p=>valid.has(p)));
+  if (selectedAccounts.size===0) ACCOUNTS.forEach(a=>selectedAccounts.add(a.publisher)); // default: all
+})();
+function saveAccounts(){ try{ localStorage.setItem("selectedPublishers", JSON.stringify([...selectedAccounts])); }catch(e){} }
+
+function renderAccounts(){
+  const step = document.getElementById("account-step");
+  if (step) step.style.display = (ACCOUNTS.length > 1) ? "" : "none";
+  const wrap = $("#account-list"); if (!wrap) return;
+  const f = ($("#account-search").value||"").toLowerCase();
+  wrap.innerHTML = "";
+  ACCOUNTS.filter(a => !f || a.publisher.toLowerCase().includes(f)).forEach(a => {
+    const on = selectedAccounts.has(a.publisher);
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "country-chip" + (on ? " is-selected" : "");
+    chip.textContent = `${a.publisher} (${a.app_count})`;
+    chip.addEventListener("click", () => {
+      if (on) selectedAccounts.delete(a.publisher); else selectedAccounts.add(a.publisher);
+      if (selectedAccounts.size===0) ACCOUNTS.forEach(x=>selectedAccounts.add(x.publisher)); // never empty
+      saveAccounts(); renderAccounts(); renderAppOptions();
+    });
+    wrap.appendChild(chip);
+  });
+}
+
+function renderAppOptions(){
+  const sel = $("#app-select"); if (!sel) return;
+  const f = ($("#app-search").value||"").toLowerCase();
+  const prev = state.app_id;
+  sel.innerHTML = '<option value="">— Choose an app —</option>';
+  ALL_APPS
+    .filter(a => selectedAccounts.has(a.publisher))
+    .filter(a => !f || (a.name||"").toLowerCase().includes(f) || (a.app_id||"").toLowerCase().includes(f))
+    .forEach(a => {
+      const o = document.createElement("option");
+      o.value = a.id; o.dataset.platform = a.platform;
+      o.textContent = `${a.name || a.app_id} · ${a.platform} · ${a.app_id}`;
+      if (prev && String(a.id) === String(prev)) o.selected = true;
+      sel.appendChild(o);
+    });
+  // If the previously-chosen app is now hidden (account/search changed), reset.
+  const stillVisible = ALL_APPS.some(a => String(a.id)===String(prev) && selectedAccounts.has(a.publisher));
+  if (prev && !stillVisible){
+    state.app_id=null; state.app_label=""; state.platform=""; state.ad_units=[];
+    const astep = $("#adunit-step"); if (astep) astep.style.display="none";
+    updatePreview();
+  }
+}
+
+(function(){
+  const as = $("#account-search"); if (as) as.addEventListener("input", renderAccounts);
+  const aps = $("#app-search"); if (aps) aps.addEventListener("input", renderAppOptions);
+  renderAccounts(); renderAppOptions();
+})();
+
 $("#app-select").addEventListener("change", e => {
   state.app_id = e.target.value || null;
   const opt = e.target.options[e.target.selectedIndex];
@@ -260,8 +332,6 @@ $("#country-paste").addEventListener("change", e => {
   renderCountries(); updatePreview();
 });
 $("#line-count").addEventListener("change", e => { state.line_count = Math.max(1, Math.min(MAX_LINES, +e.target.value || DEFAULT_LINES)); updatePreview(); if (state.report) renderReport(); });
-$("#floor-type").addEventListener("change", e => { state.floor_type = e.target.value; updatePreview(); });
-$("#unique-names").addEventListener("change", e => { state.unique_names = e.target.checked; updatePreview(); });
 $("#name-prefix").addEventListener("input", e => { state.name_prefix = e.target.value || "Group"; updatePreview(); });
 
 $("#fetch-report-btn").addEventListener("click", async () => {
@@ -271,12 +341,18 @@ $("#fetch-report-btn").addEventListener("click", async () => {
     const ad_unit_ids = state.ad_units.map(u => u.ad_unit_id);
     const res = await fetch("/mediation/builder/fetch-report", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ ad_unit_ids }),
+      body: JSON.stringify({
+        ad_unit_ids,
+        country_mode: state.country_mode,
+        countries: [...state.countries],
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Fetch failed");
     state.report = data.report || {};
-    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days)`;
+    const geo = (data.countries && data.countries.length)
+      ? `Geo: ${data.countries.join(", ")}` : "Geo: Global (all countries)";
+    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo}`;
     renderReport();
     $("#report-section").style.display = "";
     $("#report-section").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -289,11 +365,18 @@ $("#fetch-report-btn").addEventListener("click", async () => {
 
 function fmtPct(n) { return (n * 100).toFixed(2) + "%"; }
 function fmtUSD(n) { return "$" + (n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+const TIER_MULTIPLIERS = {{ tier_multipliers|tojson }};
+const MIN_ECPM = {{ min_ecpm }};
+const MAX_ECPM = {{ max_ecpm }};
+
 function computeLines(avg, count) {
-  const TOP = {{ top_mult }}, STEP = {{ step_factor }};
-  let v = avg * TOP, out = [];
-  for (let i = 0; i < count; i++) { out.push(+v.toFixed(2)); v *= STEP; }
-  return out;
+  // V1 = highest (top), VN = lowest (bottom). Pick first `count` multipliers.
+  // Each tier = base × Vx multiplier, clamped to [MIN_ECPM, MAX_ECPM].
+  return TIER_MULTIPLIERS.slice(0, Math.min(count, TIER_MULTIPLIERS.length))
+    .map(m => {
+      const v = avg * m;
+      return +Math.min(MAX_ECPM, Math.max(MIN_ECPM, v)).toFixed(2);
+    });
 }
 
 function renderReport() {
@@ -442,8 +525,16 @@ async function submitGroups(endpoint, label) {
       } else {
         msg = `Saved ${data.groups.length} draft group(s) locally (not pushed to AdMob).`;
       }
+      // Stay on the Builder so the same app + ad units remain selected. This
+      // lets the user create another country-level group for the SAME app
+      // without re-selecting everything: just change the country above,
+      // Fetch Report again (now geo-scoped), and push.
+      msg += `\n\n────────────────────\n` +
+             `You're still on the Builder — your app & ad units stay selected.\n` +
+             `To make another country's group for this app: change the country\n` +
+             `above → Fetch Report again → push. Open /mediation to view all groups.`;
       alert(msg);
-      window.location = "/mediation";
+      btn.disabled = false; btn.textContent = orig;
     } catch (err) {
       alert("Error: " + err.message);
       btn.disabled = false; btn.textContent = orig;
@@ -535,123 +626,6 @@ document.getElementById("push-existing-btn").addEventListener("click", async () 
     btn.disabled = false; btn.textContent = orig;
   }
 });
-
-// ============================================================
-// AdMob internal-API path — the backend creates real AdMob Network
-// waterfall lines using the user's saved admob.google.com session.
-// The checkbox reveals a session-paste panel + a push button.
-// ============================================================
-function refreshSessionStatus(saved, at) {
-  const el = document.getElementById("session-status");
-  if (!el) return;
-  el.innerHTML = saved
-    ? '<span class="pill pill-good">AdMob session saved</span> ' +
-      (at ? '<span class="muted">updated ' + at + '</span>' : '')
-    : '<span class="pill">No AdMob session saved yet</span>';
-}
-refreshSessionStatus(ADMOB_SESSION_SAVED, ADMOB_SESSION_AT);
-
-const __useInternalApiCb = $("#use-internal-api");
-if (__useInternalApiCb) {
-  __useInternalApiCb.addEventListener("change", e => {
-    state.use_internal_api = e.target.checked;
-    const panel = document.getElementById("internal-api-panel");
-    const acts = document.getElementById("internal-actions");
-    if (panel) panel.style.display = e.target.checked ? "" : "none";
-    if (acts) acts.style.display = e.target.checked ? "" : "none";
-  });
-}
-
-const __saveSessionBtn = document.getElementById("save-session-btn");
-if (__saveSessionBtn) {
-  __saveSessionBtn.addEventListener("click", async () => {
-    const curl = (document.getElementById("session-curl").value || "").trim();
-    if (!curl) { alert("Paste your AdMob cURL first."); return; }
-    __saveSessionBtn.disabled = true;
-    const orig = __saveSessionBtn.textContent;
-    __saveSessionBtn.textContent = "Saving...";
-    try {
-      const res = await fetch("/mediation/builder/save-admob-session", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ curl }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Save failed");
-      refreshSessionStatus(true, data.saved_at);
-      document.getElementById("session-curl").value = "";
-      alert("AdMob session saved (cookie length " + data.cookie_len + "). " +
-            "It will be reused on every run until it expires.");
-    } catch (err) {
-      alert("Could not save session:\n\n" + err.message);
-    } finally {
-      __saveSessionBtn.disabled = false;
-      __saveSessionBtn.textContent = orig;
-    }
-  });
-}
-
-const __internalPushBtn = document.getElementById("internal-push-btn");
-if (__internalPushBtn) {
-  __internalPushBtn.addEventListener("click", async () => {
-    const items = state.ad_units.map(u => {
-      const lines = $$(`.line-input[data-au="${u.ad_unit_id}"]`)
-        .map(i => +i.value || 0);
-      return {
-        ad_unit_id: u.ad_unit_id, ad_unit_name: u.name,
-        ad_format: u.ad_format,
-        metrics: (state.report || {})[u.ad_unit_id] || {},
-        lines,
-      };
-    });
-    const total = items.reduce((s, it) => s + it.lines.filter(l => l > 0).length, 0);
-    if (!items.length || !total) {
-      alert("Select ad units and make sure their tier eCPMs are filled.");
-      return;
-    }
-    if (!confirm("Create real AdMob Network waterfall groups via the internal API?\n\n" +
-        "• " + items.length + " mediation group(s)\n" +
-        "• " + total + " waterfall tier line(s) total\n\n" +
-        "This writes directly to your AdMob account. Continue?")) return;
-    __internalPushBtn.disabled = true;
-    const orig = __internalPushBtn.textContent;
-    __internalPushBtn.textContent = "Creating... (may take a minute)";
-    const out = document.getElementById("internal-result");
-    out.style.display = ""; out.textContent = "Working...";
-    try {
-      const res = await fetch("/mediation/builder/push-internal", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          app_id: state.app_id, name_prefix: state.name_prefix,
-          unique_names: state.unique_names, items,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Request failed");
-      let msg = "";
-      (data.results || []).forEach(r => {
-        msg += (r.ok ? "OK    " : "FAIL  ") + r.group + "\n";
-        if (r.group_id) msg += "      AdMob group id: " + r.group_id + "\n";
-        (r.log || []).forEach(l => { msg += "      " + l + "\n"; });
-        if (r.error) msg += "      ERROR: " + r.error + "\n";
-        msg += "\n";
-      });
-      if (data.session_expired) {
-        msg += ">>> Your AdMob session expired. Paste a fresh cURL in the " +
-               "panel above, save it, then retry.\n";
-      }
-      out.textContent = msg || "No results returned.";
-      const okCount = (data.results || []).filter(r => r.ok).length;
-      if (okCount && !data.session_expired) {
-        alert(okCount + " group(s) created. Refresh AdMob → Mediation to confirm.");
-      }
-    } catch (err) {
-      out.textContent = "Error: " + err.message;
-    } finally {
-      __internalPushBtn.disabled = false;
-      __internalPushBtn.textContent = orig;
-    }
-  });
-}
 
 updatePreview();
 </script>

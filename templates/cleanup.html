@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}Cleanup · Mediation Tool{% endblock %}
+{% block content %}
+<section class="page-head">
+  <p class="eyebrow">Cleanup</p>
+  <h1 class="display">Delete ad units &amp; mediation groups</h1>
+  <p class="lede">Pick an app, review what exists in your AdMob account — loaded instantly from the last sync, no API wait — then select all or specific items and delete.</p>
+</section>
+
+{% if not apps %}
+<div class="empty"><p>No apps cached yet. Sync first.
+  <form method="post" action="/apps/sync" style="display:inline"><button class="btn-primary" type="submit">↻ Sync from AdMob</button></form></p></div>
+{% else %}
+<div class="alert alert-warn" style="margin-bottom:20px">
+  <strong>Before you delete:</strong> Ad units are <strong>permanently removed</strong> from AdMob (along with their waterfall &amp; bidding mappings). Mediation groups have no hard-delete in the AdMob API — selected groups are <strong>disabled</strong> (they stop serving and can be re-enabled later).
+</div>
+
+<section class="card" style="margin-bottom:18px">
+  <p class="card-label">Select app</p>
+  <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px">
+    <select id="app-select" style="min-width:280px;padding:10px;border-radius:8px;background:var(--bg-3);color:var(--ink);border:1px solid var(--line-2);color-scheme:dark">
+      <option value="">— choose an app —</option>
+      {% for app in apps %}<option value="{{ app.id }}">{{ app.name or app.app_id }} · {{ app.platform }}</option>{% endfor %}
+    </select>
+    <button class="btn-secondary" id="load-btn" type="button">Load inventory</button>
+    <span id="sync-note" class="small mono"></span>
+  </div>
+</section>
+
+<div id="inventory" style="display:none">
+  <section style="margin-bottom:24px">
+    <h2 class="section-title">Ad units (<span id="au-count">0</span>)</h2>
+    <label style="display:inline-flex;gap:8px;align-items:center;margin:6px 0 10px"><input type="checkbox" id="au-all"> <strong>Select all ad units</strong></label>
+    <table class="table">
+      <thead><tr><th style="width:36px"></th><th>Name</th><th>Format</th><th>Ad unit ID</th></tr></thead>
+      <tbody id="au-body"></tbody>
+    </table>
+    <p id="au-empty" class="small" style="display:none">No ad units cached for this app.</p>
+  </section>
+
+  <section style="margin-bottom:24px">
+    <h2 class="section-title">Mediation groups (<span id="mg-count">0</span>)</h2>
+    <label style="display:inline-flex;gap:8px;align-items:center;margin:6px 0 10px"><input type="checkbox" id="mg-all"> <strong>Select all groups</strong></label>
+    <table class="table">
+      <thead><tr><th style="width:36px"></th><th>Name</th><th>Format</th><th>Platform</th><th>Lines</th><th>State</th></tr></thead>
+      <tbody id="mg-body"></tbody>
+    </table>
+    <p id="mg-empty" class="small" style="display:none">No mediation groups cached for this app.</p>
+  </section>
+
+  <section class="cta-row">
+    <button class="btn-danger" id="delete-btn" type="button" disabled>🗑 Delete selected</button>
+    <span id="status-msg" class="small"></span>
+  </section>
+  <pre id="result-box" class="mono small" style="display:none;white-space:pre-wrap;margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:8px;background:rgba(0,0,0,0.15)"></pre>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var current = null;
+
+  function selectedUnitIds(){
+    return Array.prototype.slice.call(document.querySelectorAll(".au-cb:checked")).map(function(c){ return c.dataset.id; });
+  }
+  function selectedGroupIds(){
+    return Array.prototype.slice.call(document.querySelectorAll(".mg-cb:checked")).map(function(c){ return c.dataset.id; });
+  }
+  function refreshDeleteBtn(){
+    $("delete-btn").disabled = (selectedUnitIds().length + selectedGroupIds().length) === 0;
+  }
+  function esc(s){ var d = document.createElement("div"); d.textContent = (s == null ? "" : String(s)); return d.innerHTML; }
+
+  function load(){
+    var id = $("app-select").value;
+    if(!id){ $("inventory").style.display = "none"; return; }
+    $("load-btn").disabled = true; $("sync-note").textContent = "Loading…";
+    fetch("/cleanup/inventory/" + id).then(function(r){ return r.json(); }).then(function(data){
+      current = data;
+      $("sync-note").textContent = "Last synced: " + (data.app.last_synced_at || "never");
+      var aub = $("au-body"); aub.innerHTML = "";
+      (data.ad_units || []).forEach(function(u){
+        var tr = document.createElement("tr");
+        tr.innerHTML = '<td><input type="checkbox" class="au-cb" data-id="' + esc(u.ad_unit_id) + '"></td>' +
+          '<td>' + esc(u.name) + '</td><td><span class="pill">' + esc(u.ad_format) + '</span></td>' +
+          '<td class="mono small">' + esc(u.ad_unit_id) + '</td>';
+        aub.appendChild(tr);
+      });
+      $("au-count").textContent = (data.ad_units || []).length;
+      $("au-empty").style.display = (data.ad_units || []).length ? "none" : "block";
+
+      var mgb = $("mg-body"); mgb.innerHTML = "";
+      (data.groups || []).forEach(function(g){
+        var dis = (g.state === "DISABLED");
+        var tr = document.createElement("tr");
+        tr.innerHTML = '<td><input type="checkbox" class="mg-cb" data-id="' + esc(g.group_id) + '"' + (dis ? " disabled" : "") + '></td>' +
+          '<td>' + esc(g.display_name) + '</td><td><span class="pill">' + esc(g.ad_format) + '</span></td>' +
+          '<td>' + esc(g.platform) + '</td><td>' + esc(g.line_count) + '</td>' +
+          '<td>' + (dis ? '<span class="pill">DISABLED</span>' : esc(g.state)) + '</td>';
+        mgb.appendChild(tr);
+      });
+      $("mg-count").textContent = (data.groups || []).length;
+      $("mg-empty").style.display = (data.groups || []).length ? "none" : "block";
+
+      $("au-all").checked = false; $("mg-all").checked = false;
+      $("inventory").style.display = "block";
+      $("result-box").style.display = "none";
+      refreshDeleteBtn();
+    }).catch(function(e){ $("sync-note").textContent = "Failed to load: " + e; })
+      .finally(function(){ $("load-btn").disabled = false; });
+  }
+
+  document.addEventListener("change", function(e){
+    if(e.target.id === "au-all"){
+      document.querySelectorAll(".au-cb").forEach(function(c){ c.checked = e.target.checked; });
+    } else if(e.target.id === "mg-all"){
+      document.querySelectorAll(".mg-cb:not([disabled])").forEach(function(c){ c.checked = e.target.checked; });
+    }
+    if(e.target.classList && (e.target.classList.contains("au-cb") || e.target.classList.contains("mg-cb"))){
+      refreshDeleteBtn();
+    } else if(e.target.id === "au-all" || e.target.id === "mg-all"){
+      refreshDeleteBtn();
+    }
+  });
+
+  $("load-btn").addEventListener("click", load);
+
+  $("delete-btn").addEventListener("click", function(){
+    var units = selectedUnitIds(), groups = selectedGroupIds();
+    if(units.length + groups.length === 0){ return; }
+    var msg = "Delete " + units.length + " ad unit(s) (PERMANENT) and disable " + groups.length + " mediation group(s)?";
+    if(!confirm(msg)){ return; }
+    $("delete-btn").disabled = true; $("status-msg").textContent = "Working…";
+    fetch("/cleanup/delete", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ app_db_id: parseInt($("app-select").value, 10), ad_unit_ids: units, group_ids: groups })
+    }).then(function(r){ return r.json(); }).then(function(res){
+      $("status-msg").textContent = (res.status === "ok" ? "✓ Done" : "⚠ Completed with issues");
+      var box = $("result-box");
+      box.style.display = "block"; box.textContent = JSON.stringify(res, null, 2);
+      load();
+    }).catch(function(e){ $("status-msg").textContent = "Failed: " + e; })
+      .finally(function(){ refreshDeleteBtn(); });
+  });
+})();
+</script>
+{% endif %}
+{% endblock %}

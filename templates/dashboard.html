@@ -8,9 +8,55 @@
   <article class="card"><p class="card-label">Cached apps</p><p class="card-value">{{ app_count }}</p><a class="card-link" href="/apps">Manage →</a></article>
   <article class="card"><p class="card-label">Mediation groups</p><p class="card-value">{{ group_count }}</p><a class="card-link" href="/mediation">Open →</a></article>
 </section>
+{% if accounts %}
+<section class="card" style="margin:8px 0 20px">
+  <p class="card-label">AdMob Account{% if accounts|length > 1 %} <span class="muted small">(applies in Builder)</span>{% endif %}</p>
+  {% if accounts|length > 1 %}<input type="text" id="acct-search" placeholder="Search accounts…" style="margin:8px 0;max-width:320px" />{% endif %}
+  <div id="acct-chips" class="country-chips"></div>
+  {% if accounts|length > 1 %}
+  <p class="muted small">Applies in the Builder. Add more via admob.google.com → Sync.</p>
+  {% else %}
+  <p class="muted small">Add another account on admob.google.com → <a href="/apps">Sync</a>.</p>
+  {% endif %}
+</section>
+<script>
+(function(){
+  const ACCOUNTS = {{ accounts|tojson }};
+  let sel = new Set();
+  try { (JSON.parse(localStorage.getItem("selectedPublishers")||"[]")||[]).forEach(p=>sel.add(p)); } catch(e){}
+  const valid = new Set(ACCOUNTS.map(a=>a.publisher));
+  sel = new Set([...sel].filter(p=>valid.has(p)));
+  if (sel.size===0) ACCOUNTS.forEach(a=>sel.add(a.publisher));
+  function save(){ try{ localStorage.setItem("selectedPublishers", JSON.stringify([...sel])); }catch(e){} }
+  function render(){
+    const wrap = document.getElementById("acct-chips");
+    const se = document.getElementById("acct-search");
+    const f = ((se ? se.value : "")||"").toLowerCase();
+    wrap.innerHTML = "";
+    ACCOUNTS.filter(a => !f || a.publisher.toLowerCase().includes(f)).forEach(a => {
+      const on = sel.has(a.publisher);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "country-chip" + (on ? " is-selected" : "");
+      chip.textContent = `${a.publisher} (${a.app_count})`;
+      chip.addEventListener("click", () => {
+        if (on) sel.delete(a.publisher); else sel.add(a.publisher);
+        if (sel.size===0) ACCOUNTS.forEach(x=>sel.add(x.publisher));
+        save(); render();
+      });
+      wrap.appendChild(chip);
+    });
+  }
+  const __s = document.getElementById("acct-search");
+  if (__s) __s.addEventListener("input", render);
+  save(); render();
+})();
+</script>
+{% endif %}
 <section class="cta-row">
   <a class="btn-primary" href="/mediation/builder">▶ Open Mediation Builder</a>
   <form method="post" action="/apps/sync" style="display:inline"><button type="submit" class="btn-secondary">↻ Sync Apps + Ad Units</button></form>
+  <a class="btn-danger" href="/cleanup">🗑 Delete Ad Units &amp; Groups</a>
 </section>
 <section class="workflow">
   <h2 class="section-title">How the waterfall builder works</h2>

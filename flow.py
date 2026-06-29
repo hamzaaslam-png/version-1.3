@@ -58,10 +58,11 @@ from fastapi import APIRouter, Body, Depends, FastAPI, Form, HTTPException, Requ
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
-from googleapiclient.discovery import build
+from googleapiclient.discovery import build, build_from_document
 from googleapiclient.errors import HttpError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import (
@@ -91,6 +92,13 @@ class Settings(BaseSettings):
     host: str = "localhost"
     port: int = 8000
     debug: bool = True
+    # Security. In production (HTTPS, e.g. Cloud Run) set cookie_secure=true so
+    # the session cookie is only ever sent over HTTPS. Keep false for local
+    # http://localhost dev. `secret_key` MUST be a strong random value in
+    # production — it both signs sessions AND derives the AES-256 data key, so
+    # a weak/default value compromises every encrypted token. Startup refuses
+    # to run with a weak key unless debug=true.
+    cookie_secure: bool = False
     oauth_scopes: list[str] = [
         "https://www.googleapis.com/auth/admob.readonly",
         "https://www.googleapis.com/auth/admob.report",
@@ -158,10 +166,26 @@ def _timed(label: str, fn):
 # ============================================================================
 # WATERFALL FORMULA  (tweak constants to change calculation)
 # ============================================================================
-WATERFALL_TOP_MULTIPLIER = 1.91
-WATERFALL_STEP_FACTOR = 0.80
-WATERFALL_DEFAULT_LINES = 5
-WATERFALL_MAX_LINES = 20
+# Per-tier multipliers applied to the BASE eCPM (last-7-day average).
+# V1 = top of waterfall (highest eCPM), V10 = bottom. Pick the first N
+# multipliers when the user chooses N tiers.
+WATERFALL_TIER_MULTIPLIERS = [
+    3.0,    # V1 (top)
+    2.75,   # V2
+    2.5,    # V3
+    2.2,    # V4
+    1.9,    # V5
+    1.75,   # V6
+    1.55,   # V7
+    1.3,    # V8
+    1.15,   # V9
+    0.9,    # V10 (bottom)
+]
+# Clamp every tier eCPM to this range — AdMob mediation hard limits.
+WATERFALL_MIN_ECPM = 0.2
+WATERFALL_MAX_ECPM = 1000.0
+WATERFALL_DEFAULT_LINES = 10  # default = max (use all V1..V10 multipliers)
+WATERFALL_MAX_LINES = len(WATERFALL_TIER_MULTIPLIERS)  # 10
 
 
 COMMON_COUNTRIES = [
@@ -209,9 +233,11 @@ NETWORK_CATALOG = [
     },
     {
         "code": "META",
-        "name": "Meta Audience Network",
-        "admob_source_id": "10568273989961140677",
+        "name": "Meta",
+        "admob_source_id": "10568273599589928883",
+        "admob_bidding_source_id": "11198165126854996598",
         "supports_bidding": True,
+        "supports_formats": ["BANNER", "INTERSTITIAL", "NATIVE", "REWARDED", "APP_OPEN"],
         "app_fields": [],
         "ad_unit_fields": [
             {"key": "placement_id", "label": "Placement ID", "type": "text",
@@ -223,7 +249,10 @@ NETWORK_CATALOG = [
         "code": "APPLOVIN",
         "name": "AppLovin",
         "admob_source_id": "1063618907739174004",
+        "admob_bidding_source_id": "1328079684332308356",
         "supports_bidding": True,
+        "supports_formats": ["BANNER", "INTERSTITIAL", "NATIVE", "REWARDED",
+                             "REWARDED_INTERSTITIAL", "APP_OPEN"],
         "app_fields": [
             {"key": "sdk_key", "label": "SDK Key", "type": "password",
              "admob_key": "sdk_key",
@@ -237,9 +266,12 @@ NETWORK_CATALOG = [
     },
     {
         "code": "UNITY",
-        "name": "Unity Ads",
+        "name": "Unity",
         "admob_source_id": "4970775877303683148",
+        "admob_bidding_source_id": "7069338991535737586",
         "supports_bidding": True,
+        "supports_formats": ["BANNER", "INTERSTITIAL", "REWARDED",
+                             "REWARDED_INTERSTITIAL", "APP_OPEN"],
         "app_fields": [
             {"key": "game_id", "label": "Game ID", "type": "text",
              "admob_key": "game_id",
@@ -255,7 +287,9 @@ NETWORK_CATALOG = [
         "code": "IRONSOURCE",
         "name": "ironSource",
         "admob_source_id": "6925240245545091930",
+        "admob_bidding_source_id": "1643326773739866623",
         "supports_bidding": True,
+        "supports_formats": ["BANNER", "INTERSTITIAL", "REWARDED", "APP_OPEN"],
         "app_fields": [
             {"key": "app_key", "label": "App Key", "type": "password",
              "admob_key": "app_key",
@@ -270,8 +304,11 @@ NETWORK_CATALOG = [
     {
         "code": "MINTEGRAL",
         "name": "Mintegral",
-        "admob_source_id": "1357746574408583713",
+        "admob_source_id": "1357746574408896200",
+        "admob_bidding_source_id": "6250601289653372374",
         "supports_bidding": True,
+        "supports_formats": ["BANNER", "INTERSTITIAL", "NATIVE", "REWARDED",
+                             "REWARDED_INTERSTITIAL", "APP_OPEN"],
         "app_fields": [
             {"key": "app_id", "label": "App ID", "type": "text",
              "admob_key": "app_id",
@@ -292,17 +329,39 @@ NETWORK_CATALOG = [
     {
         "code": "PANGLE",
         "name": "Pangle",
-        "admob_source_id": "4646036753406801667",
+        "admob_source_id": "4069896914521993236",
+        "admob_bidding_source_id": "3525379893916449117",
         "supports_bidding": True,
+        "supports_formats": ["BANNER", "INTERSTITIAL", "NATIVE", "REWARDED",
+                             "REWARDED_INTERSTITIAL", "APP_OPEN"],
         "app_fields": [
             {"key": "app_id", "label": "App ID", "type": "text",
              "admob_key": "app_id",
              "help": "Pangle dashboard → App management"},
         ],
         "ad_unit_fields": [
-            {"key": "slot_id", "label": "Slot ID", "type": "text",
-             "admob_key": "slot_id",
-             "help": "Pangle dashboard → Ad placements"},
+            {"key": "slot_id", "label": "Ad Placement ID", "type": "text",
+             "admob_key": "ad_placement_id",
+             "help": "Pangle dashboard → Ad placements (the placement ID)"},
+        ],
+    },
+    {
+        "code": "LIFTOFF",
+        "name": "Liftoff_Monetize",
+        "admob_source_id": "1953547073528090325",
+        "admob_bidding_source_id": "4692500501762622185",
+        "supports_bidding": True,
+        "supports_formats": ["BANNER", "INTERSTITIAL", "NATIVE", "REWARDED",
+                             "REWARDED_INTERSTITIAL", "APP_OPEN"],
+        "app_fields": [
+            {"key": "application_id", "label": "Application ID", "type": "text",
+             "admob_key": "application_id",
+             "help": "Liftoff dashboard → Apps → Application ID"},
+        ],
+        "ad_unit_fields": [
+            {"key": "placement_reference_id", "label": "Placement Reference ID",
+             "type": "text", "admob_key": "placement_reference_id",
+             "help": "Liftoff dashboard → Placements"},
         ],
     },
 ]
@@ -312,12 +371,27 @@ NETWORK_BY_CODE = {n["code"]: n for n in NETWORK_CATALOG}
 # ============================================================================
 # CREDENTIAL ENCRYPTION
 # ============================================================================
+# Authenticated encryption at rest. Primary scheme is AES-256-GCM (256-bit
+# key, 96-bit random nonce, built-in integrity tag — tampering is detected on
+# decrypt). The legacy Fernet (AES-128-CBC+HMAC) path is kept ONLY to decrypt
+# data written by older builds; everything new is written as AES-256-GCM.
+_AES_KEY = None
 _FERNET = None
+_ENC_PREFIX = "g1:"  # version tag identifying an AES-256-GCM blob
+
+
+def _aes_key() -> bytes:
+    """32-byte (256-bit) key derived from secret_key — AES-256."""
+    global _AES_KEY
+    if _AES_KEY is None:
+        import hashlib
+        raw = (settings.secret_key or "change-me-in-env").encode("utf-8")
+        _AES_KEY = hashlib.sha256(raw).digest()  # 32 bytes
+    return _AES_KEY
 
 
 def _get_fernet():
-    # Built once and reused — the SHA-256 key derivation + Fernet construction
-    # otherwise re-runs on every encrypt_dict / decrypt_dict call.
+    # Legacy decryptor for blobs written before the AES-256-GCM migration.
     global _FERNET
     if _FERNET is None:
         import base64, hashlib
@@ -328,15 +402,49 @@ def _get_fernet():
     return _FERNET
 
 
+def encrypt_str(plaintext: str) -> str:
+    """Encrypt a string with AES-256-GCM. Output: 'g1:' + base64(nonce|ct|tag)."""
+    import base64
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    nonce = os.urandom(12)
+    ct = AESGCM(_aes_key()).encrypt(nonce, (plaintext or "").encode("utf-8"), None)
+    return _ENC_PREFIX + base64.urlsafe_b64encode(nonce + ct).decode("ascii")
+
+
+def decrypt_str(token: str) -> str:
+    """Decrypt a value produced by encrypt_str. Transparently handles three
+    legacy forms so existing data keeps working:
+      - 'g1:...'   -> AES-256-GCM (current)
+      - 'gAAAAA...' -> old Fernet token
+      - anything else -> assumed pre-encryption plaintext, returned as-is."""
+    if not token:
+        return ""
+    if token.startswith(_ENC_PREFIX):
+        import base64
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        try:
+            raw = base64.urlsafe_b64decode(token[len(_ENC_PREFIX):].encode("ascii"))
+            return AESGCM(_aes_key()).decrypt(raw[:12], raw[12:], None).decode("utf-8")
+        except Exception:
+            return ""
+    if token.startswith("gAAAAA"):  # legacy Fernet
+        try:
+            return _get_fernet().decrypt(token.encode("ascii")).decode("utf-8")
+        except Exception:
+            return ""
+    return token  # legacy plaintext (e.g. OAuth tokens stored before encryption)
+
+
 def encrypt_dict(d: dict) -> str:
-    return _get_fernet().encrypt(json.dumps(d or {}).encode("utf-8")).decode("ascii")
+    return encrypt_str(json.dumps(d or {}))
 
 
 def decrypt_dict(token: str) -> dict:
-    if not token:
+    raw = decrypt_str(token)
+    if not raw:
         return {}
     try:
-        return json.loads(_get_fernet().decrypt(token.encode("ascii")).decode("utf-8"))
+        return json.loads(raw)
     except Exception:
         return {}
 
@@ -474,16 +582,51 @@ class AdUnitMapping(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-class AdMobSession(Base):
-    """The user's admob.google.com browser session, captured once from a
-    DevTools cURL. Used by the internal-API path to create real AdMob
-    Network waterfall lines. Stored encrypted; cookies expire so this is
-    refreshed when the API returns 401/403."""
-    __tablename__ = "admob_sessions"
+class BiddingFormatMapping(Base):
+    """Per-(app, network, ad_format) bidding mapping. Each (network, format)
+    pair has ONE mapping — the user picks WHICH ad unit gets the bidding
+    config (via `ad_unit_id`) and fills the network's mapping fields ONCE.
+    At mediation-group push time, if the builder's "Include All Bidding
+    Networks" toggle is on and the pushed source ad unit matches this
+    mapping's `ad_unit_id`, the mapping becomes a real AdUnitMapping on the
+    source + a LIVE bidding line on the group."""
+    __tablename__ = "bidding_format_mappings_v2"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True)
-    encrypted_blob = Column(Text, default="")  # {cookie, xsrf, f_sid}
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    app_id = Column(Integer, ForeignKey("admob_apps.id"), nullable=False, index=True)
+    network_code = Column(String(32), nullable=False)
+    ad_format = Column(String(32), nullable=False)
+    ad_unit_id = Column(String(128), default="")  # the chosen ad unit
+    encrypted_fields = Column(Text, default="")
+    enabled = Column(Boolean, default=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdMobMediationGroupCache(Base):
+    """Cached snapshot of the mediation groups that ALREADY exist in the
+    user's AdMob account, pulled during Sync. This lets the Cleanup screen
+    list every existing group instantly (straight from the DB) without
+    re-hitting the AdMob API every time — sync once, browse fast. Scoped per
+    (user, publisher) and fully refreshed on each account-scoped sync."""
+    __tablename__ = "admob_mediation_group_cache"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    publisher_id = Column(String(64), default="", index=True)
+    group_id = Column(String(64), nullable=False)          # mediationGroupId
+    display_name = Column(String(255), default="")
+    platform = Column(String(16), default="")
+    ad_format = Column(String(32), default="")
+    state = Column(String(16), default="")                 # ENABLED / DISABLED
+    ad_unit_ids = Column(JSON, default=list)               # targeting ad unit ids
+    line_count = Column(Integer, default=0)
+    last_synced_at = Column(DateTime, default=datetime.utcnow)
+
+
+# Ad formats that bidding can be configured for.
+BIDDING_FORMATS = [
+    "APP_OPEN", "BANNER", "INTERSTITIAL",
+    "NATIVE", "REWARDED", "REWARDED_INTERSTITIAL",
+]
 
 
 # ============================================================================
@@ -515,8 +658,8 @@ def get_authorization_url() -> Tuple[str, str, str]:
 
 def credentials_from_db(token_row) -> Credentials:
     creds = Credentials(
-        token=token_row.access_token,
-        refresh_token=token_row.refresh_token or None,
+        token=decrypt_str(token_row.access_token) or None,
+        refresh_token=decrypt_str(token_row.refresh_token) or None,
         token_uri=token_row.token_uri,
         client_id=settings.google_client_id,
         client_secret=settings.google_client_secret,
@@ -527,8 +670,21 @@ def credentials_from_db(token_row) -> Credentials:
     return creds
 
 
-def refresh_if_needed(creds: Credentials) -> Credentials:
-    if creds.expired and creds.refresh_token:
+def refresh_if_needed(creds: Credentials, force: bool = False) -> Credentials:
+    """Refresh the access token when it can't be trusted.
+
+    The default google `Credentials.expired` check only fires once the
+    locally-stored expiry timestamp is in the past — so it MISSES the cases
+    that produce a UNAUTHENTICATED error from AdMob:
+      - `expiry is None` (never persisted): `expired` is always False, so the
+        token is never refreshed and silently rots after ~1 hour.
+      - the grant changed server-side (access re-granted, account removed,
+        re-consented elsewhere) while the local clock still says "valid".
+    We therefore refresh when forced, when the creds aren't valid, OR when we
+    have no expiry to trust. Caller is responsible for handling RefreshError
+    (raised when the refresh token itself was revoked)."""
+    needs_refresh = force or not creds.valid or creds.expiry is None
+    if needs_refresh and creds.refresh_token:
         creds.refresh(GoogleRequest())
     return creds
 
@@ -538,9 +694,9 @@ def persist_credentials(db: Session, user: User, creds: Credentials) -> None:
     if token_row is None:
         token_row = OAuthToken(user_id=user.id)
         db.add(token_row)
-    token_row.access_token = creds.token or ""
+    token_row.access_token = encrypt_str(creds.token or "")
     if creds.refresh_token:
-        token_row.refresh_token = creds.refresh_token
+        token_row.refresh_token = encrypt_str(creds.refresh_token)
     token_row.token_uri = creds.token_uri or "https://oauth2.googleapis.com/token"
     token_row.expiry = creds.expiry if isinstance(creds.expiry, datetime) else None
     token_row.scopes = ",".join(creds.scopes or [])
@@ -633,6 +789,25 @@ def _build_tier_name(prefix: str, ad_unit_name: str, tier: int, ecpm: float,
     return f"{prefix}_{short_name}_line_{tier}_waterfall_ecpm_{ecpm:.2f}{suffix}"[:80]
 
 
+# google-api-python-client ships static discovery docs only for "admob" v1 and
+# v1beta. The `v1alpha` surface (which exposes adMobNetworkWaterfallAdUnits —
+# the resource that creates real AdMob Network Waterfall backing units) isn't
+# bundled, so we fetch its discovery document over HTTP once and cache it at
+# module scope.
+_ADMOB_V1ALPHA_DOC: dict | None = None
+
+
+def _get_admob_v1alpha_doc() -> dict:
+    global _ADMOB_V1ALPHA_DOC
+    if _ADMOB_V1ALPHA_DOC is None:
+        resp = requests.get(
+            "https://admob.googleapis.com/$discovery/rest?version=v1alpha",
+            timeout=20)
+        resp.raise_for_status()
+        _ADMOB_V1ALPHA_DOC = resp.json()
+    return _ADMOB_V1ALPHA_DOC
+
+
 class AdMobClient:
     def __init__(self, db: Session, user: User):
         self.db = db
@@ -641,62 +816,120 @@ class AdMobClient:
             raise RuntimeError("User has no OAuth token. Sign in again.")
         creds = credentials_from_db(user.token)
         prev_token = creds.token
-        creds = refresh_if_needed(creds)
+        try:
+            creds = refresh_if_needed(creds)
+        except RefreshError as e:
+            raise AdMobAPIError(
+                "Your Google authorization expired or was revoked. "
+                "Sign out and sign in again to reconnect AdMob."
+            ) from e
         # Only write the token back to the DB when it actually changed (i.e.
         # it was refreshed) — persisting unconditionally hits the DB on every
         # request even when nothing changed.
         if creds.token != prev_token:
             persist_credentials(db, user, creds)
+        self._creds = creds
+        self._build_services()
+
+    def _build_services(self) -> None:
+        """(Re)build the discovery service clients from the current creds.
+        Called on init and again after a forced re-auth so the new access
+        token is used."""
+        creds = self._creds
         self.service = build("admob", "v1", credentials=creds, cache_discovery=False)
         self.service_beta = build("admob", "v1beta", credentials=creds, cache_discovery=False)
-        self._creds = creds
+        # v1alpha — fetched lazily; if the network fetch fails the service is
+        # set to None and any caller that needs it raises a clear error.
+        try:
+            self.service_alpha = build_from_document(
+                _get_admob_v1alpha_doc(), credentials=creds)
+        except Exception as e:
+            _log(f"  warning: AdMob v1alpha unavailable ({type(e).__name__}: {e})")
+            self.service_alpha = None
+
+    def _force_reauth(self) -> None:
+        """Force-refresh the access token, persist it, and rebuild the service
+        clients. Used when AdMob returns UNAUTHENTICATED on a token that the
+        local expiry clock still considered valid (e.g. the grant changed
+        server-side). Raises RefreshError if the refresh token was revoked."""
+        self._creds = refresh_if_needed(self._creds, force=True)
+        persist_credentials(self.db, self.user, self._creds)
+        self._build_services()
 
     def list_accounts(self) -> list[dict]:
-        try:
-            return self.service.accounts().list().execute().get("account", [])
-        except HttpError as e:
-            raise AdMobAPIError(_format_http_error(e)) from e
+        return self._with_quota_retry(
+            lambda: self.service.accounts().list().execute()
+        ).get("account", [])
 
     def get_publisher_id(self) -> str:
-        if self.user.admob_publisher_id:
-            return self.user.admob_publisher_id
+        """Resolve the publisher ID this token is actually authorized for.
+
+        The cached `user.admob_publisher_id` (seeded from .env or a prior
+        sign-in) is NOT trusted blindly: AdMob returns a misleading
+        `401 UNAUTHENTICATED / "missing required authentication credential"`
+        — NOT 403 — when you query a publisher the token doesn't own. So if
+        the user switched AdMob accounts, the stale cached ID makes every call
+        look like an auth failure. We therefore verify the cached ID against
+        the accounts this token can actually access, and switch to the real
+        one if it isn't in the list. Verified once per client instance."""
+        if getattr(self, "_publisher_id", None):
+            return self._publisher_id
+        cached = (self.user.admob_publisher_id or "").strip()
         accounts = self.list_accounts()
         if not accounts:
             raise AdMobAPIError(
                 "No AdMob account found for this Google user. "
                 "Sign in with the Google account that owns the AdMob publisher."
             )
-        pub_id = accounts[0]["publisherId"]
-        self.user.admob_publisher_id = pub_id
-        self.db.commit()
+        accessible = [a.get("publisherId", "") for a in accounts if a.get("publisherId")]
+        if cached and cached in accessible:
+            pub_id = cached
+        else:
+            pub_id = accessible[0]
+            if cached and cached != pub_id:
+                _log(f"  cached publisher {cached} is not accessible by this "
+                     f"Google account; switching to {pub_id}")
+            self.user.admob_publisher_id = pub_id
+            self.db.commit()
+        self._publisher_id = pub_id
         return pub_id
 
     def list_apps(self) -> list[dict]:
         parent = f"accounts/{self.get_publisher_id()}"
-        try:
-            return self.service.accounts().apps().list(parent=parent).execute().get("apps", [])
-        except HttpError as e:
-            raise AdMobAPIError(_format_http_error(e)) from e
+        return self._with_quota_retry(
+            lambda: self.service.accounts().apps().list(parent=parent).execute()
+        ).get("apps", [])
 
     def list_ad_units(self) -> list[dict]:
         parent = f"accounts/{self.get_publisher_id()}"
-        try:
-            return self.service.accounts().adUnits().list(parent=parent).execute().get("adUnits", [])
-        except HttpError as e:
-            raise AdMobAPIError(_format_http_error(e)) from e
+        return self._with_quota_retry(
+            lambda: self.service.accounts().adUnits().list(parent=parent).execute()
+        ).get("adUnits", [])
 
     def fetch_network_report_for_ad_units(self, ad_unit_ids: list[str],
-                                          start: str, end: str) -> dict[str, dict]:
+                                          start: str, end: str,
+                                          countries: list[str] | None = None) -> dict[str, dict]:
         if not ad_unit_ids:
             return {}
         parent = f"accounts/{self.get_publisher_id()}"
+        dimension_filters = [
+            {"dimension": "AD_UNIT", "matchesAny": {"values": ad_unit_ids}}
+        ]
+        # Country-scoped metrics. When specific countries are requested we add a
+        # COUNTRY dimension filter so eCPM / revenue / requests reflect THAT geo
+        # instead of the global all-countries aggregate. Without this filter the
+        # report returns identical totals for every country selected in the UI.
+        # COUNTRY values are ISO 3166-1 alpha-2 codes (US, IN, SA, BR, ...).
+        cc = [c.strip().upper() for c in (countries or []) if c and c.strip()]
+        if cc:
+            dimension_filters.append(
+                {"dimension": "COUNTRY", "matchesAny": {"values": cc}}
+            )
         body = {
             "reportSpec": {
                 "dateRange": {"startDate": _date_parts(start), "endDate": _date_parts(end)},
                 "dimensions": ["AD_UNIT"],
-                "dimensionFilters": [
-                    {"dimension": "AD_UNIT", "matchesAny": {"values": ad_unit_ids}}
-                ],
+                "dimensionFilters": dimension_filters,
                 "metrics": [
                     "AD_REQUESTS", "MATCHED_REQUESTS", "IMPRESSIONS",
                     "ESTIMATED_EARNINGS", "CLICKS", "IMPRESSION_CTR",
@@ -704,10 +937,9 @@ class AdMobClient:
                 ],
             }
         }
-        try:
-            resp = self.service.accounts().networkReport().generate(parent=parent, body=body).execute()
-        except HttpError as e:
-            raise AdMobAPIError(_format_http_error(e)) from e
+        resp = self._with_quota_retry(
+            lambda: self.service.accounts().networkReport().generate(parent=parent, body=body).execute()
+        )
 
         rows = resp if isinstance(resp, list) else []
         out: dict[str, dict] = {}
@@ -772,10 +1004,9 @@ class AdMobClient:
         if hasattr(self, "_ad_sources_cache"):
             return self._ad_sources_cache
         parent = f"accounts/{self.get_publisher_id()}"
-        try:
-            resp = self.service_beta.accounts().adSources().list(parent=parent).execute()
-        except HttpError as e:
-            raise AdMobAPIError(_format_http_error(e)) from e
+        resp = self._with_quota_retry(
+            lambda: self.service_alpha.accounts().adSources().list(parent=parent).execute()
+        )
         self._ad_sources_cache = resp.get("adSources", []) or []
         return self._ad_sources_cache
 
@@ -784,44 +1015,31 @@ class AdMobClient:
         if hasattr(self, cache_key):
             return getattr(self, cache_key)
         parent = f"accounts/{self.get_publisher_id()}/adSources/{ad_source_id}"
-        try:
-            resp = self.service_beta.accounts().adSources().adapters().list(parent=parent).execute()
-        except HttpError as e:
-            raise AdMobAPIError(_format_http_error(e)) from e
+        resp = self._with_quota_retry(
+            lambda: self.service_alpha.accounts().adSources().adapters().list(parent=parent).execute()
+        )
         out = resp.get("adapters", []) or []
         setattr(self, cache_key, out)
         return out
 
     def find_source_id_for_network(self, network_code: str) -> str:
-        """Resolve the WATERFALL (non-bidding) ad source id for a network.
-
-        Matches on the brand's first word (meta / applovin / unity /
-        ironsource / mintegral / pangle) and PREFERS a title that does NOT
-        contain '(bidding)', so MANUAL waterfall lines bind to the
-        waterfall source rather than the bidding variant.
-        """
+        """Resolve the WATERFALL (non-bidding) ad source id for a network."""
         cat = NETWORK_BY_CODE.get(network_code.upper())
         if not cat:
             return ""
-        name = cat["name"].lower()
-        primary = name.split()[0] if name.split() else name
-        try:
-            sources = self.list_ad_sources()
-        except AdMobAPIError:
-            return cat["admob_source_id"]
-        matches: list[tuple[str, str]] = []
-        for src in sources:
-            title = (src.get("title") or "").lower()
-            sid = src.get("adSourceId") or ""
-            if primary and primary in title and sid:
-                matches.append((title, sid))
-        # prefer non-bidding (the waterfall source)
-        for title, sid in matches:
-            if "(bidding)" not in title:
-                return sid
-        if matches:
-            return matches[0][1]
-        return cat["admob_source_id"]
+        return cat.get("admob_source_id") or ""
+
+    def find_bidding_source_id_for_network(self, network_code: str) -> str:
+        """Resolve the BIDDING ad source id for a network. AdMob exposes a
+        separate "(bidding)" source per network (e.g. Mintegral=
+        1357746574408896200 vs Mintegral (bidding)=6250601289653372374).
+        Bidding LIVE lines AND their AdUnitMappings MUST use the bidding
+        source; using the waterfall source triggers "CPM mode unsupported"
+        or adapter-mismatch errors."""
+        cat = NETWORK_BY_CODE.get(network_code.upper())
+        if not cat:
+            return ""
+        return cat.get("admob_bidding_source_id") or cat.get("admob_source_id") or ""
 
     # Two distinct AdMob ad sources — DO NOT confuse them:
     #  - "AdMob Network"           -> LIVE bidding line. Only 1 per group.
@@ -929,7 +1147,7 @@ class AdMobClient:
             body["displayName"] = display_name[:80]
         try:
             resp = self._with_quota_retry(
-                lambda: self.service_beta.accounts().adUnits()
+                lambda: self.service_alpha.accounts().adUnits()
                 .adUnitMappings().create(parent=parent, body=body).execute()
             )
         except HttpError as e:
@@ -954,7 +1172,7 @@ class AdMobClient:
             if page_token:
                 kwargs["pageToken"] = page_token
             resp = self._with_quota_retry(
-                lambda kw=kwargs: self.service_beta.accounts()
+                lambda kw=kwargs: self.service_alpha.accounts()
                 .mediationGroups().list(**kw).execute()
             )
             for g in resp.get("mediationGroups", []) or []:
@@ -974,18 +1192,28 @@ class AdMobClient:
     # Quota / rate-limit retry helper
     # ========================================================================
     def _with_quota_retry(self, fn, max_retries: int = 2, base_delay: float = 3.0):
-        """Execute fn(); on RESOURCE_EXHAUSTED / quota / 429, retry with a
-        SHORT backoff (3s, 6s ≈ 9s total) and then give up. We deliberately
-        fail fast: if the quota window is genuinely empty (e.g. daily cap
-        exceeded from prior test runs), waiting 2+ minutes per call doesn't
-        help — the only fix is to wait minutes/hours or request a quota
-        increase in Google Cloud Console.
+        """Execute fn(); transparently recover from two classes of error:
+
+        1. UNAUTHENTICATED / 401 — the access token went stale even though the
+           local expiry clock still considered it valid (this happens when the
+           AdMob grant changes server-side). We force a token refresh ONCE,
+           rebuild the service clients, and retry. If the refresh token itself
+           was revoked, we surface a clean "sign in again" message instead of
+           a cryptic 502.
+        2. RESOURCE_EXHAUSTED / quota / 429 — retry with a SHORT backoff
+           (3s, 6s ≈ 9s total) and then give up. We deliberately fail fast: if
+           the quota window is genuinely empty (e.g. daily cap exceeded from
+           prior test runs), waiting 2+ minutes per call doesn't help — the
+           only fix is to wait minutes/hours or request a quota increase in
+           Google Cloud Console.
 
         Sometimes a 60-second sleep helps; usually it doesn't. If you do
         want longer retries on a specific call, bump max_retries at the
         call site rather than globally."""
         last_err: HttpError | None = None
-        for attempt in range(max_retries):
+        auth_retried = False
+        attempt = 0
+        while attempt < max_retries:
             try:
                 return fn()
             except HttpError as e:
@@ -995,6 +1223,29 @@ class AdMobClient:
                 except Exception:
                     pass
                 full = f"{str(e).lower()} {content_lower}"
+                status = getattr(getattr(e, "resp", None), "status", None)
+
+                # --- auth recovery (force-refresh + retry, once) ---
+                is_auth = (
+                    status == 401
+                    or "unauthenticated" in full
+                    or "missing required authentication" in full
+                    or "invalid authentication credential" in full
+                    or "invalid_grant" in full
+                )
+                if is_auth and not auth_retried:
+                    auth_retried = True
+                    _log("     ⚠ AdMob auth error; forcing token refresh and retrying")
+                    try:
+                        self._force_reauth()
+                    except RefreshError as re:
+                        raise AdMobAPIError(
+                            "Your Google authorization expired or was revoked. "
+                            "Sign out and sign in again to reconnect AdMob."
+                        ) from re
+                    continue  # retry without consuming a quota attempt
+
+                # --- quota / rate-limit recovery ---
                 is_quota = any(kw in full for kw in (
                     "exhausted", "resource_exhausted", "quota",
                     "rate limit", "ratelimit", "429",
@@ -1006,6 +1257,7 @@ class AdMobClient:
                          f"(attempt {attempt + 1}/{max_retries})")
                     time.sleep(wait)
                     last_err = e
+                    attempt += 1
                     continue
                 raise AdMobAPIError(_format_http_error(e)) from e
         if last_err is not None:
@@ -1021,13 +1273,12 @@ class AdMobClient:
         """
         short_id = ad_unit_id.split("/")[-1] if "/" in ad_unit_id else ad_unit_id
         parent = f"accounts/{self.get_publisher_id()}/adUnits/{short_id}"
-        try:
-            resp = self.service_beta.accounts().adUnits().adUnitMappings().list(
+        resp = self._with_quota_retry(
+            lambda: self.service_alpha.accounts().adUnits().adUnitMappings().list(
                 parent=parent,
             ).execute()
-            return resp.get("adUnitMappings", []) or []
-        except HttpError as e:
-            raise AdMobAPIError(_format_http_error(e)) from e
+        )
+        return resp.get("adUnitMappings", []) or []
 
     def get_adapter_to_source_map(self) -> dict[str, str]:
         """Build and cache {adapter_id: ad_source_id} for every adapter under
@@ -1051,6 +1302,88 @@ class AdMobClient:
             pass
         self._adapter_source_map = mapping
         return mapping
+
+    # ========================================================================
+    # v1alpha — AdMob Network Waterfall ad units (the real backing units that
+    # the old internal-cURL hack tried to fake). These ARE creatable via the
+    # public v1alpha API; the earlier "HARD LIMIT — UI only" conclusion was
+    # based on v1beta, which doesn't expose this resource.
+    # ========================================================================
+    def list_waterfall_ad_units(self, page_size: int = 1000) -> list[dict]:
+        """List all AdMob Network Waterfall backing ad units (v1alpha)."""
+        if self.service_alpha is None:
+            raise AdMobAPIError(
+                "AdMob v1alpha service not available — discovery doc "
+                "fetch failed at startup")
+        units: list[dict] = []
+        page = None
+        while True:
+            kw = {"parent": f"accounts/{self.get_publisher_id()}",
+                  "pageSize": page_size}
+            if page:
+                kw["pageToken"] = page
+            try:
+                r = (self.service_alpha.accounts()
+                     .adMobNetworkWaterfallAdUnits().list(**kw).execute())
+            except HttpError as e:
+                raise AdMobAPIError(_format_http_error(e)) from e
+            units.extend(r.get("adMobNetworkWaterfallAdUnits", []) or [])
+            page = r.get("nextPageToken")
+            if not page:
+                break
+        return units
+
+    def batch_create_waterfall_ad_units(self, *, app_id: str,
+                                         primary_ad_unit_id: str,
+                                         ad_format: str,
+                                         tiers: list[tuple]) -> list[dict]:
+        """Batch-create AdMob Network Waterfall backing units (v1alpha) —
+        the public-API replacement for the old internal-cURL hack.
+
+        Args:
+          app_id: full app id, e.g. "ca-app-pub-XXX~YYYY".
+          primary_ad_unit_id: full ad unit id, e.g. "ca-app-pub-XXX/YYY" —
+            AdMob auto-creates an AdUnitMapping from this primary ad unit to
+            each created backing unit (returned in
+            mappingSetting.adUnitMappingId).
+          ad_format: BANNER / INTERSTITIAL / NATIVE / REWARDED /
+            REWARDED_INTERSTITIAL / APP_OPEN.
+          tiers: [(display_name, ecpm_usd), ...] — one entry per backing unit.
+
+        Returns the created `adMobNetworkWaterfallAdUnits` list — each item
+        carries `name`, `admobNetworkWaterfallAdUnitId` (the "pubid"), and
+        `mappingSetting.adUnitMappingId` (the auto-created mapping)."""
+        if self.service_alpha is None:
+            raise AdMobAPIError(
+                "AdMob v1alpha service not available — discovery doc "
+                "fetch failed at startup")
+        fmt = (ad_format or "").upper()
+        # RICH_MEDIA is rejected for REWARDED / REWARDED_INTERSTITIAL per the
+        # v1alpha schema; for everything else both media types are allowed.
+        ad_types = (["VIDEO"]
+                    if fmt in ("REWARDED", "REWARDED_INTERSTITIAL")
+                    else ["RICH_MEDIA", "VIDEO"])
+        body = {"requests": [{
+            "adMobNetworkWaterfallAdUnit": {
+                "appId": app_id,
+                "displayName": (name or "")[:80],
+                "format": fmt,
+                "adTypes": ad_types,
+                "cpmFloorSettings": {
+                    "globalFloorMicros":
+                        str(int(round(float(ecpm) * 1_000_000)))
+                },
+                "mappingSetting": {"primaryAdUnitId": primary_ad_unit_id},
+            }
+        } for (name, ecpm) in tiers]}
+        try:
+            r = (self.service_alpha.accounts()
+                 .adMobNetworkWaterfallAdUnits().batchCreate(
+                     parent=f"accounts/{self.get_publisher_id()}",
+                     body=body).execute())
+        except HttpError as e:
+            raise AdMobAPIError(_format_http_error(e)) from e
+        return r.get("adMobNetworkWaterfallAdUnits", []) or []
 
     # ========================================================================
     # NEW (FIX): replicate source ad unit's bidding mappings to tier ad units
@@ -1171,7 +1504,7 @@ class AdMobClient:
                 }
                 try:
                     resp = self._with_quota_retry(
-                        lambda b=body, p=parent: self.service_beta.accounts()
+                        lambda b=body, p=parent: self.service_alpha.accounts()
                         .adUnits().adUnitMappings().create(
                             parent=p, body=b,
                         ).execute()
@@ -1303,7 +1636,7 @@ class AdMobClient:
                 "rewardItem": "reward",
             }
         return self._with_quota_retry(
-            lambda: self.service_beta.accounts().adUnits().create(
+            lambda: self.service_alpha.accounts().adUnits().create(
                 parent=parent, body=body,
             ).execute()
         )
@@ -1311,18 +1644,49 @@ class AdMobClient:
     # ========================================================================
     # (Third-party adapter helpers — kept for /networks UI parity)
     # ========================================================================
-    def resolve_adapter_for_network(self, network_code: str, platform: str) -> dict | None:
-        source_id = self.find_source_id_for_network(network_code)
+    def resolve_adapter_for_network(self, network_code: str, platform: str,
+                                     ad_format: str | None = None,
+                                     for_bidding: bool = False) -> dict | None:
+        """Resolve the adapter for (network, platform, ad_format). When
+        `for_bidding` is True, look up adapters under the NETWORK's BIDDING
+        ad source (separate from waterfall) — required for LIVE bidding
+        lines and their mappings."""
+        source_id = (self.find_bidding_source_id_for_network(network_code)
+                     if for_bidding
+                     else self.find_source_id_for_network(network_code))
         if not source_id:
             return None
         try:
             adapters = self.list_adapters_for_source(source_id)
         except AdMobAPIError:
             return None
-        target = (platform or "").upper()
+        target_plat = (platform or "").upper()
+        target_fmt = (ad_format or "").upper()
+        # AdMob uses slightly different names for App Open depending on the
+        # API version / surface — match all variants.
+        fmt_aliases = {
+            "APP_OPEN":     {"APP_OPEN", "APP_OPEN_AD", "APPOPEN"},
+            "APP_OPEN_AD":  {"APP_OPEN", "APP_OPEN_AD", "APPOPEN"},
+        }
+        target_fmts = fmt_aliases.get(target_fmt, {target_fmt} if target_fmt else set())
+        # First pass: match on platform AND format
+        if target_fmt:
+            for ad in adapters:
+                if (ad.get("platform") or "").upper() != target_plat:
+                    continue
+                ad_fmts = {(f or "").upper() for f in (ad.get("formats") or [])}
+                if target_fmts & ad_fmts:
+                    return ad
+            # STRICT: when caller specified a format, do NOT silently fall back
+            # to a different-format adapter. Returning a mismatched adapter
+            # was the root cause of "Mediation group line CPM mode unsupported"
+            # (the resulting LIVE bidding line was structurally invalid for
+            # the source ad unit's format). Returning None lets the caller
+            # cleanly skip this network with a clear error.
+            return None
+        # No format requested → platform-only.
         for ad in adapters:
-            ad_platform = (ad.get("platform") or "").upper()
-            if ad_platform == target:
+            if (ad.get("platform") or "").upper() == target_plat:
                 return ad
         return adapters[0] if adapters else None
 
@@ -1331,11 +1695,16 @@ class AdMobClient:
         network_code: str,
         platform: str,
         user_fields: dict,
+        ad_format: str | None = None,
+        for_bidding: bool = False,
     ) -> tuple[str, dict, list[str]]:
-        adapter = self.resolve_adapter_for_network(network_code, platform)
+        adapter = self.resolve_adapter_for_network(
+            network_code, platform, ad_format, for_bidding=for_bidding)
         if adapter is None:
             raise AdMobAPIError(
-                f"Could not find an AdMob adapter for {network_code} on {platform}."
+                f"{network_code} does not support {ad_format or '(no format)'} "
+                f"bidding on {platform} — no matching AdMob adapter "
+                f"exists. Skipping this network for this group."
             )
         adapter_id = str(adapter.get("adapterId", ""))
         metadata = adapter.get("adapterConfigMetadata", []) or []
@@ -1373,9 +1742,13 @@ class AdMobClient:
         platform: str,
         display_name: str,
         user_fields: dict,
+        ad_format: str | None = None,
+        for_bidding: bool = False,
     ) -> tuple[dict, list[str]]:
         adapter_id, configs, warnings = self.build_admob_config_payload(
-            network_code=network_code, platform=platform, user_fields=user_fields,
+            network_code=network_code, platform=platform,
+            user_fields=user_fields, ad_format=ad_format,
+            for_bidding=for_bidding,
         )
         if not configs:
             raise AdMobAPIError(
@@ -1392,7 +1765,7 @@ class AdMobClient:
             "state": "ENABLED",
         }
         try:
-            resp = self.service_beta.accounts().adUnits().adUnitMappings().create(
+            resp = self.service_alpha.accounts().adUnits().adUnitMappings().create(
                 parent=parent, body=body,
             ).execute()
             return resp, warnings
@@ -1430,7 +1803,7 @@ class AdMobClient:
     def list_mediation_groups_in_admob(self) -> list[dict]:
         parent = f"accounts/{self.get_publisher_id()}"
         try:
-            resp = self.service_beta.accounts().mediationGroups().list(
+            resp = self.service_alpha.accounts().mediationGroups().list(
                 parent=parent, pageSize=200,
             ).execute()
         except HttpError as e:
@@ -1450,6 +1823,60 @@ class AdMobClient:
                 "line_count": len(g.get("mediationGroupLines", {}) or {}),
             })
         return out
+
+    # ========================================================================
+    # CLEANUP — delete ad units / disable mediation groups
+    # ========================================================================
+    def batch_delete_ad_units(self, ad_unit_ids: list[str],
+                              dry_run: bool = False) -> dict:
+        """Hard-delete ad units via v1alpha `adUnits:batchDelete`.
+
+        `ad_unit_ids` are full ids of the form 'ca-app-pub-XXXX/YYYY'. AdMob
+        deletes the unit and any waterfall/bidding mappings hanging off it.
+        Sent in chunks so a large selection doesn't blow the request limit.
+        Returns {"deleted": <n>} (0 when dry_run)."""
+        if self.service_alpha is None:
+            raise AdMobAPIError(
+                "AdMob v1alpha service not available — discovery doc "
+                "fetch failed at startup")
+        ids = [u for u in ad_unit_ids if u]
+        if not ids:
+            return {"deleted": 0}
+        parent = f"accounts/{self.get_publisher_id()}"
+        deleted = 0
+        CHUNK = 100
+        for i in range(0, len(ids), CHUNK):
+            chunk = ids[i:i + CHUNK]
+            self._with_quota_retry(
+                lambda c=chunk: self.service_alpha.accounts().adUnits().batchDelete(
+                    parent=parent,
+                    body={"adUnitIds": c, "dryRun": dry_run},
+                ).execute()
+            )
+            if not dry_run:
+                deleted += len(chunk)
+        return {"deleted": deleted}
+
+    def disable_mediation_group(self, group_id: str) -> dict:
+        """Stop a mediation group from serving.
+
+        The AdMob API exposes NO hard-delete for mediation groups (the
+        resource only supports list/create/patch). The closest equivalent —
+        and what the AdMob UI's "remove" effectively does for API clients —
+        is patching `state` to DISABLED: the group stops serving ads and
+        collecting stats, and can later be re-enabled. Returns the patched
+        group resource."""
+        if self.service_alpha is None:
+            raise AdMobAPIError(
+                "AdMob v1alpha service not available — discovery doc "
+                "fetch failed at startup")
+        name = (f"accounts/{self.get_publisher_id()}"
+                f"/mediationGroups/{group_id}")
+        return self._with_quota_retry(
+            lambda: self.service_alpha.accounts().mediationGroups().patch(
+                name=name, body={"state": "DISABLED"}, updateMask="state",
+            ).execute()
+        )
 
     def patch_lines_into_group(
         self,
@@ -1488,21 +1915,18 @@ class AdMobClient:
                 "cpmMicros": str(cpm_micros),
                 "state": "ENABLED",
             }
-            # FieldMask for map subfields uses dot notation
-            # (parent.key.subfield), not Python-style brackets. The bracketed
-            # form `mediation_group_lines["-1"].cpm_micros` is rejected by
-            # AdMob with INVALID_ARGUMENT. Also: AdMob accepts both snake_case
-            # (the proto field name) and lowerCamelCase (the JSON name); we
-            # use snake_case to match the proto definition.
-            update_mask_paths.append(f"mediation_group_lines.{line_id}.cpm_micros")
-            update_mask_paths.append(f"mediation_group_lines.{line_id}.cpm_mode")
-            update_mask_paths.append(f"mediation_group_lines.{line_id}.display_name")
-            update_mask_paths.append(f"mediation_group_lines.{line_id}.state")
-            update_mask_paths.append(f"mediation_group_lines.{line_id}.ad_source_id")
+            # v1alpha FieldMask uses BRACKETED syntax for map subfields:
+            # `mediationGroupLines["-1"].cpm_micros` (camelCase parent +
+            # bracketed key + snake_case leaf). Verified live earlier.
+            update_mask_paths.append(f'mediationGroupLines["{line_id}"].cpm_micros')
+            update_mask_paths.append(f'mediationGroupLines["{line_id}"].cpm_mode')
+            update_mask_paths.append(f'mediationGroupLines["{line_id}"].display_name')
+            update_mask_paths.append(f'mediationGroupLines["{line_id}"].state')
+            update_mask_paths.append(f'mediationGroupLines["{line_id}"].ad_source_id')
         body = {"mediationGroupLines": new_lines}
         name = f"accounts/{self.get_publisher_id()}/mediationGroups/{mediation_group_id}"
         try:
-            return self.service_beta.accounts().mediationGroups().patch(
+            return self.service_alpha.accounts().mediationGroups().patch(
                 name=name,
                 body=body,
                 updateMask=",".join(update_mask_paths),
@@ -1549,13 +1973,13 @@ class AdMobClient:
             lines[f"-{key}"] = bl
             key += 1
 
-        ad_format_map = {
-            "BANNER": "BANNER", "INTERSTITIAL": "INTERSTITIAL",
-            "REWARDED": "REWARDED", "REWARDED_INTERSTITIAL": "REWARDED_INTERSTITIAL",
-            "NATIVE": "NATIVE", "APP_OPEN": "APP_OPEN_AD",
-            "APP_OPEN_AD": "APP_OPEN_AD",
-        }
-        admob_format = ad_format_map.get(ad_format.upper(), ad_format.upper())
+        # v1alpha mediationGroups.create accepts "APP_OPEN" (NO "_AD" suffix)
+        # — v1beta's "APP_OPEN_AD" was being rejected with "Format must be one
+        # of the supported formats". Normalise APP_OPEN_AD → APP_OPEN for the
+        # v1alpha enum.
+        admob_format = (ad_format or "").upper()
+        if admob_format == "APP_OPEN_AD":
+            admob_format = "APP_OPEN"
         targeting: dict = {
             "platform": platform.upper(),
             "format": admob_format,
@@ -1571,8 +1995,13 @@ class AdMobClient:
         if lines:
             body["mediationGroupLines"] = lines
         parent = f"accounts/{self.get_publisher_id()}"
+        # Use v1alpha (the one we've verified end-to-end), not v1beta. v1beta
+        # was rejecting APP_OPEN_AD; v1alpha cleanly accepts APP_OPEN.
+        if self.service_alpha is None:
+            raise AdMobAPIError(
+                "v1alpha service not available — needed for mediationGroups.create")
         resp = self._with_quota_retry(
-            lambda: self.service_beta.accounts().mediationGroups().create(
+            lambda: self.service_alpha.accounts().mediationGroups().create(
                 parent=parent, body=body,
             ).execute()
         )
@@ -1605,7 +2034,9 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
         <a href="/dashboard">Dashboard</a>
         <a href="/apps">Apps</a>
         <a href="/networks">Networks</a>
+        <a href="/bidding">Bidding</a>
         <a href="/mediation">Mediation</a>
+        <a href="/cleanup">Cleanup</a>
         <a href="/mediation/builder" class="cta">+ Builder</a>
         <span class="sep"></span>
         <span class="user-chip">{% if user.picture %}<img src="{{ user.picture }}" alt="" />{% endif %}<span>{{ user.email }}</span></span>
@@ -1654,9 +2085,55 @@ TEMPLATE_FILES["dashboard.html"] = r"""{% extends "base.html" %}
   <article class="card"><p class="card-label">Cached apps</p><p class="card-value">{{ app_count }}</p><a class="card-link" href="/apps">Manage →</a></article>
   <article class="card"><p class="card-label">Mediation groups</p><p class="card-value">{{ group_count }}</p><a class="card-link" href="/mediation">Open →</a></article>
 </section>
+{% if accounts %}
+<section class="card" style="margin:8px 0 20px">
+  <p class="card-label">AdMob Account{% if accounts|length > 1 %} <span class="muted small">(applies in Builder)</span>{% endif %}</p>
+  {% if accounts|length > 1 %}<input type="text" id="acct-search" placeholder="Search accounts…" style="margin:8px 0;max-width:320px" />{% endif %}
+  <div id="acct-chips" class="country-chips"></div>
+  {% if accounts|length > 1 %}
+  <p class="muted small">Applies in the Builder. Add more via admob.google.com → Sync.</p>
+  {% else %}
+  <p class="muted small">Add another account on admob.google.com → <a href="/apps">Sync</a>.</p>
+  {% endif %}
+</section>
+<script>
+(function(){
+  const ACCOUNTS = {{ accounts|tojson }};
+  let sel = new Set();
+  try { (JSON.parse(localStorage.getItem("selectedPublishers")||"[]")||[]).forEach(p=>sel.add(p)); } catch(e){}
+  const valid = new Set(ACCOUNTS.map(a=>a.publisher));
+  sel = new Set([...sel].filter(p=>valid.has(p)));
+  if (sel.size===0) ACCOUNTS.forEach(a=>sel.add(a.publisher));
+  function save(){ try{ localStorage.setItem("selectedPublishers", JSON.stringify([...sel])); }catch(e){} }
+  function render(){
+    const wrap = document.getElementById("acct-chips");
+    const se = document.getElementById("acct-search");
+    const f = ((se ? se.value : "")||"").toLowerCase();
+    wrap.innerHTML = "";
+    ACCOUNTS.filter(a => !f || a.publisher.toLowerCase().includes(f)).forEach(a => {
+      const on = sel.has(a.publisher);
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "country-chip" + (on ? " is-selected" : "");
+      chip.textContent = `${a.publisher} (${a.app_count})`;
+      chip.addEventListener("click", () => {
+        if (on) sel.delete(a.publisher); else sel.add(a.publisher);
+        if (sel.size===0) ACCOUNTS.forEach(x=>sel.add(x.publisher));
+        save(); render();
+      });
+      wrap.appendChild(chip);
+    });
+  }
+  const __s = document.getElementById("acct-search");
+  if (__s) __s.addEventListener("input", render);
+  save(); render();
+})();
+</script>
+{% endif %}
 <section class="cta-row">
   <a class="btn-primary" href="/mediation/builder">▶ Open Mediation Builder</a>
   <form method="post" action="/apps/sync" style="display:inline"><button type="submit" class="btn-secondary">↻ Sync Apps + Ad Units</button></form>
+  <a class="btn-danger" href="/cleanup">🗑 Delete Ad Units &amp; Groups</a>
 </section>
 <section class="workflow">
   <h2 class="section-title">How the waterfall builder works</h2>
@@ -1673,6 +2150,155 @@ TEMPLATE_FILES["dashboard.html"] = r"""{% extends "base.html" %}
     <li><span class="step-no">10</span><span class="step-text">Tool reads the group back and audits every line's state. Disabled lines are surfaced as errors.</span></li>
   </ol>
 </section>
+{% endblock %}"""
+
+TEMPLATE_FILES["cleanup.html"] = r"""{% extends "base.html" %}
+{% block title %}Cleanup · Mediation Tool{% endblock %}
+{% block content %}
+<section class="page-head">
+  <p class="eyebrow">Cleanup</p>
+  <h1 class="display">Delete ad units &amp; mediation groups</h1>
+  <p class="lede">Pick an app, review what exists in your AdMob account — loaded instantly from the last sync, no API wait — then select all or specific items and delete.</p>
+</section>
+
+{% if not apps %}
+<div class="empty"><p>No apps cached yet. Sync first.
+  <form method="post" action="/apps/sync" style="display:inline"><button class="btn-primary" type="submit">↻ Sync from AdMob</button></form></p></div>
+{% else %}
+<div class="alert alert-warn" style="margin-bottom:20px">
+  <strong>Before you delete:</strong> Ad units are <strong>permanently removed</strong> from AdMob (along with their waterfall &amp; bidding mappings). Mediation groups have no hard-delete in the AdMob API — selected groups are <strong>disabled</strong> (they stop serving and can be re-enabled later).
+</div>
+
+<section class="card" style="margin-bottom:18px">
+  <p class="card-label">Select app</p>
+  <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-top:8px">
+    <select id="app-select" style="min-width:280px;padding:10px;border-radius:8px;background:var(--bg-3);color:var(--ink);border:1px solid var(--line-2);color-scheme:dark">
+      <option value="">— choose an app —</option>
+      {% for app in apps %}<option value="{{ app.id }}">{{ app.name or app.app_id }} · {{ app.platform }}</option>{% endfor %}
+    </select>
+    <button class="btn-secondary" id="load-btn" type="button">Load inventory</button>
+    <span id="sync-note" class="small mono"></span>
+  </div>
+</section>
+
+<div id="inventory" style="display:none">
+  <section style="margin-bottom:24px">
+    <h2 class="section-title">Ad units (<span id="au-count">0</span>)</h2>
+    <label style="display:inline-flex;gap:8px;align-items:center;margin:6px 0 10px"><input type="checkbox" id="au-all"> <strong>Select all ad units</strong></label>
+    <table class="table">
+      <thead><tr><th style="width:36px"></th><th>Name</th><th>Format</th><th>Ad unit ID</th></tr></thead>
+      <tbody id="au-body"></tbody>
+    </table>
+    <p id="au-empty" class="small" style="display:none">No ad units cached for this app.</p>
+  </section>
+
+  <section style="margin-bottom:24px">
+    <h2 class="section-title">Mediation groups (<span id="mg-count">0</span>)</h2>
+    <label style="display:inline-flex;gap:8px;align-items:center;margin:6px 0 10px"><input type="checkbox" id="mg-all"> <strong>Select all groups</strong></label>
+    <table class="table">
+      <thead><tr><th style="width:36px"></th><th>Name</th><th>Format</th><th>Platform</th><th>Lines</th><th>State</th></tr></thead>
+      <tbody id="mg-body"></tbody>
+    </table>
+    <p id="mg-empty" class="small" style="display:none">No mediation groups cached for this app.</p>
+  </section>
+
+  <section class="cta-row">
+    <button class="btn-danger" id="delete-btn" type="button" disabled>🗑 Delete selected</button>
+    <span id="status-msg" class="small"></span>
+  </section>
+  <pre id="result-box" class="mono small" style="display:none;white-space:pre-wrap;margin-top:14px;padding:14px;border:1px solid var(--line);border-radius:8px;background:rgba(0,0,0,0.15)"></pre>
+</div>
+
+<script>
+(function(){
+  var $ = function(id){ return document.getElementById(id); };
+  var current = null;
+
+  function selectedUnitIds(){
+    return Array.prototype.slice.call(document.querySelectorAll(".au-cb:checked")).map(function(c){ return c.dataset.id; });
+  }
+  function selectedGroupIds(){
+    return Array.prototype.slice.call(document.querySelectorAll(".mg-cb:checked")).map(function(c){ return c.dataset.id; });
+  }
+  function refreshDeleteBtn(){
+    $("delete-btn").disabled = (selectedUnitIds().length + selectedGroupIds().length) === 0;
+  }
+  function esc(s){ var d = document.createElement("div"); d.textContent = (s == null ? "" : String(s)); return d.innerHTML; }
+
+  function load(){
+    var id = $("app-select").value;
+    if(!id){ $("inventory").style.display = "none"; return; }
+    $("load-btn").disabled = true; $("sync-note").textContent = "Loading…";
+    fetch("/cleanup/inventory/" + id).then(function(r){ return r.json(); }).then(function(data){
+      current = data;
+      $("sync-note").textContent = "Last synced: " + (data.app.last_synced_at || "never");
+      var aub = $("au-body"); aub.innerHTML = "";
+      (data.ad_units || []).forEach(function(u){
+        var tr = document.createElement("tr");
+        tr.innerHTML = '<td><input type="checkbox" class="au-cb" data-id="' + esc(u.ad_unit_id) + '"></td>' +
+          '<td>' + esc(u.name) + '</td><td><span class="pill">' + esc(u.ad_format) + '</span></td>' +
+          '<td class="mono small">' + esc(u.ad_unit_id) + '</td>';
+        aub.appendChild(tr);
+      });
+      $("au-count").textContent = (data.ad_units || []).length;
+      $("au-empty").style.display = (data.ad_units || []).length ? "none" : "block";
+
+      var mgb = $("mg-body"); mgb.innerHTML = "";
+      (data.groups || []).forEach(function(g){
+        var dis = (g.state === "DISABLED");
+        var tr = document.createElement("tr");
+        tr.innerHTML = '<td><input type="checkbox" class="mg-cb" data-id="' + esc(g.group_id) + '"' + (dis ? " disabled" : "") + '></td>' +
+          '<td>' + esc(g.display_name) + '</td><td><span class="pill">' + esc(g.ad_format) + '</span></td>' +
+          '<td>' + esc(g.platform) + '</td><td>' + esc(g.line_count) + '</td>' +
+          '<td>' + (dis ? '<span class="pill">DISABLED</span>' : esc(g.state)) + '</td>';
+        mgb.appendChild(tr);
+      });
+      $("mg-count").textContent = (data.groups || []).length;
+      $("mg-empty").style.display = (data.groups || []).length ? "none" : "block";
+
+      $("au-all").checked = false; $("mg-all").checked = false;
+      $("inventory").style.display = "block";
+      $("result-box").style.display = "none";
+      refreshDeleteBtn();
+    }).catch(function(e){ $("sync-note").textContent = "Failed to load: " + e; })
+      .finally(function(){ $("load-btn").disabled = false; });
+  }
+
+  document.addEventListener("change", function(e){
+    if(e.target.id === "au-all"){
+      document.querySelectorAll(".au-cb").forEach(function(c){ c.checked = e.target.checked; });
+    } else if(e.target.id === "mg-all"){
+      document.querySelectorAll(".mg-cb:not([disabled])").forEach(function(c){ c.checked = e.target.checked; });
+    }
+    if(e.target.classList && (e.target.classList.contains("au-cb") || e.target.classList.contains("mg-cb"))){
+      refreshDeleteBtn();
+    } else if(e.target.id === "au-all" || e.target.id === "mg-all"){
+      refreshDeleteBtn();
+    }
+  });
+
+  $("load-btn").addEventListener("click", load);
+
+  $("delete-btn").addEventListener("click", function(){
+    var units = selectedUnitIds(), groups = selectedGroupIds();
+    if(units.length + groups.length === 0){ return; }
+    var msg = "Delete " + units.length + " ad unit(s) (PERMANENT) and disable " + groups.length + " mediation group(s)?";
+    if(!confirm(msg)){ return; }
+    $("delete-btn").disabled = true; $("status-msg").textContent = "Working…";
+    fetch("/cleanup/delete", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ app_db_id: parseInt($("app-select").value, 10), ad_unit_ids: units, group_ids: groups })
+    }).then(function(r){ return r.json(); }).then(function(res){
+      $("status-msg").textContent = (res.status === "ok" ? "✓ Done" : "⚠ Completed with issues");
+      var box = $("result-box");
+      box.style.display = "block"; box.textContent = JSON.stringify(res, null, 2);
+      load();
+    }).catch(function(e){ $("status-msg").textContent = "Failed: " + e; })
+      .finally(function(){ refreshDeleteBtn(); });
+  });
+})();
+</script>
+{% endif %}
 {% endblock %}"""
 
 TEMPLATE_FILES["apps.html"] = r"""{% extends "base.html" %}
@@ -1768,13 +2394,18 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
 
 <div class="builder-grid">
   <div>
+    <fieldset class="builder-step" id="account-step" style="display:none">
+      <legend><span class="num">00</span> AdMob Account</legend>
+      <input type="text" id="account-search" placeholder="Search accounts…" />
+      <div id="account-list" class="country-chips" style="margin-top:8px"></div>
+      <p class="muted small">Choose one or more AdMob accounts — only their apps appear below. To add a new account: sign into it on admob.google.com → <a href="/apps">Sync</a>.</p>
+    </fieldset>
+
     <fieldset class="builder-step">
       <legend><span class="num">01</span> Select App</legend>
+      <input type="text" id="app-search" placeholder="Search apps by name or ID…" style="margin-bottom:8px" />
       <select id="app-select">
         <option value="">— Choose an app —</option>
-        {% for a in apps %}
-          <option value="{{ a.id }}" data-platform="{{ a.platform }}">{{ a.name or a.app_id }} · {{ a.platform }} · {{ a.app_id }}</option>
-        {% endfor %}
       </select>
     </fieldset>
 
@@ -1806,29 +2437,26 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
     </fieldset>
 
     <fieldset class="builder-step">
-      <legend><span class="num">04</span> Waterfall Depth &amp; Bidding</legend>
+      <legend><span class="num">04</span> Waterfall &amp; Bidding</legend>
       <div class="grid grid-2">
-        <label><span class="lbl">Number of tiers (1–{{ max_lines }})</span>
+        <label><span class="lbl">Number of waterfall lines (1–{{ max_lines }})</span>
           <input type="number" id="line-count" min="1" max="{{ max_lines }}" value="{{ default_lines }}" /></label>
-        <label><span class="lbl">Floor type (recorded locally)</span>
-          <select id="floor-type">
-            {% for f in floor_types %}<option value="{{ f }}">{{ f.replace("_"," ").title() }}</option>{% endfor %}
-          </select></label>
+        <label><span class="lbl">Group name prefix</span>
+          <input type="text" id="name-prefix" value="Global" /></label>
       </div>
-      <label class="check-row"><input type="checkbox" id="unique-names" checked /> Append random suffix to tier names</label>
-      <label class="check-row"><input type="checkbox" id="use-internal-api" /> <span><b>AdMob internal API</b> — create real AdMob Network <b>waterfall</b> lines on the backend (uses your saved AdMob session)</span></label>
-      <div id="internal-api-panel" style="display:none; margin-top:8px; padding:10px; border:1px solid var(--line); border-radius:8px">
-        <div class="small" id="session-status" style="margin-bottom:6px"></div>
-        <p class="muted small" style="margin:0 0 6px">Paste your AdMob cURL <b>once</b> — flow.py stores it encrypted and reuses it on every run. To get it: open <b>admob.google.com</b> → <b>F12</b> → <b>Network</b> tab → click any request whose URL contains <b>/rpc/</b> → right-click → Copy → <b>Copy as cURL (bash)</b>.</p>
-        <textarea id="session-curl" rows="4" spellcheck="false" placeholder="curl 'https://admob.google.com/v2/...rpc...' -H '...' -b '...'" style="width:100%; font-family:monospace; font-size:11px"></textarea>
-        <div style="margin-top:6px"><button type="button" class="btn-primary btn-sm" id="save-session-btn">Save AdMob session</button></div>
+
+      <div class="bidding-callout" id="bidding-callout">
+        <div class="bidding-callout-head">
+          <div>
+            <strong>⚡ Include All Bidding Networks</strong>
+            <p class="muted small" style="margin:4px 0 0">When ON, all enabled 3P bidding networks saved on <a href="/bidding">/bidding</a> (for this app + format) become LIVE bidding lines in the mediation group. When OFF, only the default AdMob Network LIVE line is added.</p>
+          </div>
+          <label class="bidding-toggle">
+            <input type="checkbox" id="include-bidding" checked />
+            <span class="bidding-slider"></span>
+          </label>
+        </div>
       </div>
-      <div class="muted small" style="padding:6px 0">AdMob Network only mode — creates tier ad units + a mediation group with MANUAL AdMob Network waterfall lines + AdMob Network LIVE bidding line. No 3P bidding networks.</div>
-      <div class="default-network-note">
-        <strong>⚡ AdMob Network is always present.</strong> Every mediation group has N MANUAL AdMob Network waterfall lines (one per tier eCPM) plus an explicit AdMob Network LIVE bidding line. Third-party bidding networks are added when /networks credentials exist for them.
-      </div>
-      <label class="check-row"><span class="lbl">Name prefix</span>
-        <input type="text" id="name-prefix" value="Global" /></label>
     </fieldset>
 
     <div class="form-actions">
@@ -1851,19 +2479,16 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
   <p class="muted small" id="report-date-range"></p>
   <div id="report-cards"></div>
   <div class="calc-explainer">
-    <strong>Waterfall Formula:</strong>
-    Line 1 = avg eCPM × <span class="mono">{{ top_mult }}</span>,
-    then each next line = previous × <span class="mono">{{ step_factor }}</span>.
+    <strong>Waterfall Formula:</strong> Each tier = <span class="mono">Base eCPM × Vx multiplier</span>. Base = 7-day average eCPM.
+    <br>
+    <span class="muted small mono">V1 × {{ tier_multipliers[0] }} (top) · V2 × {{ tier_multipliers[1] }} · V3 × {{ tier_multipliers[2] }} · V4 × {{ tier_multipliers[3] }} · V5 × {{ tier_multipliers[4] }} · V6 × {{ tier_multipliers[5] }} · V7 × {{ tier_multipliers[6] }} · V8 × {{ tier_multipliers[7] }} · V9 × {{ tier_multipliers[8] }} · V10 × {{ tier_multipliers[9] }} (bottom)</span>
+    <br>
+    <span class="muted small">Every tier value is clamped to <b>${{ min_ecpm }}</b> – <b>${{ max_ecpm|int }}</b>.</span>
   </div>
   <div class="form-actions">
     <button class="btn-primary btn-lg" id="push-btn">▶ Create mediation group + waterfall + bidding</button>
     <button class="btn-secondary btn-lg" id="generate-btn">Save locally only (preview/draft)</button>
   </div>
-
-  <div class="form-actions" id="internal-actions" style="display:none">
-    <button class="btn-primary btn-lg" id="internal-push-btn">▶ Create real AdMob Network waterfall (internal API)</button>
-  </div>
-  <div id="internal-result" class="muted small" style="display:none; white-space:pre-wrap; margin-top:10px; font-family:monospace; background:rgba(0,0,0,0.04); padding:10px; border-radius:8px"></div>
 
   <hr style="margin: 32px 0; border: 0; border-top: 1px solid var(--line)" />
 
@@ -1898,8 +2523,8 @@ const COUNTRIES = {{ countries|tojson }};
 const MAX_LINES = {{ max_lines }};
 const DEFAULT_LINES = {{ default_lines }};
 const EXISTING_GROUPS = {{ existing_groups|tojson }};
-const ADMOB_SESSION_SAVED = {{ 'true' if admob_session_saved else 'false' }};
-const ADMOB_SESSION_AT = "{{ admob_session_at }}";
+const ALL_APPS = {{ all_apps|tojson }};
+const ACCOUNTS = {{ accounts|tojson }};
 
 const $ = sel => document.querySelector(sel);
 const $$ = sel => [...document.querySelectorAll(sel)];
@@ -1910,13 +2535,25 @@ const state = {
   country_mode: "GLOBAL",
   countries: new Set(),
   line_count: DEFAULT_LINES,
-  floor_type: "{{ floor_types[0] }}",
+  floor_type: "ALL_PRICES",
   unique_names: true,
-  include_bidding_networks: false,
-  use_internal_api: false,
+  include_bidding_networks: true,
   name_prefix: "Global",
   report: null,
 };
+
+// Wire the "Include All Bidding Networks" toggle (default ON).
+const __incBidCb = document.getElementById("include-bidding");
+if (__incBidCb) {
+  __incBidCb.addEventListener("change", e => {
+    state.include_bidding_networks = e.target.checked;
+    const callout = document.getElementById("bidding-callout");
+    if (callout) callout.classList.toggle("is-on", e.target.checked);
+  });
+  // Initial visual state
+  const callout = document.getElementById("bidding-callout");
+  if (callout) callout.classList.toggle("is-on", __incBidCb.checked);
+}
 
 function updatePreview() {
   const el = $("#preview-summary");
@@ -1985,6 +2622,67 @@ function renderCountries() {
   });
 }
 
+// ---- AdMob account selector + per-account app filtering (with search) ----
+let selectedAccounts = new Set();
+(function initAccounts(){
+  try { (JSON.parse(localStorage.getItem("selectedPublishers")||"[]")||[]).forEach(p=>selectedAccounts.add(p)); } catch(e){}
+  const valid = new Set(ACCOUNTS.map(a=>a.publisher));
+  selectedAccounts = new Set([...selectedAccounts].filter(p=>valid.has(p)));
+  if (selectedAccounts.size===0) ACCOUNTS.forEach(a=>selectedAccounts.add(a.publisher)); // default: all
+})();
+function saveAccounts(){ try{ localStorage.setItem("selectedPublishers", JSON.stringify([...selectedAccounts])); }catch(e){} }
+
+function renderAccounts(){
+  const step = document.getElementById("account-step");
+  if (step) step.style.display = (ACCOUNTS.length > 1) ? "" : "none";
+  const wrap = $("#account-list"); if (!wrap) return;
+  const f = ($("#account-search").value||"").toLowerCase();
+  wrap.innerHTML = "";
+  ACCOUNTS.filter(a => !f || a.publisher.toLowerCase().includes(f)).forEach(a => {
+    const on = selectedAccounts.has(a.publisher);
+    const chip = document.createElement("button");
+    chip.type = "button";
+    chip.className = "country-chip" + (on ? " is-selected" : "");
+    chip.textContent = `${a.publisher} (${a.app_count})`;
+    chip.addEventListener("click", () => {
+      if (on) selectedAccounts.delete(a.publisher); else selectedAccounts.add(a.publisher);
+      if (selectedAccounts.size===0) ACCOUNTS.forEach(x=>selectedAccounts.add(x.publisher)); // never empty
+      saveAccounts(); renderAccounts(); renderAppOptions();
+    });
+    wrap.appendChild(chip);
+  });
+}
+
+function renderAppOptions(){
+  const sel = $("#app-select"); if (!sel) return;
+  const f = ($("#app-search").value||"").toLowerCase();
+  const prev = state.app_id;
+  sel.innerHTML = '<option value="">— Choose an app —</option>';
+  ALL_APPS
+    .filter(a => selectedAccounts.has(a.publisher))
+    .filter(a => !f || (a.name||"").toLowerCase().includes(f) || (a.app_id||"").toLowerCase().includes(f))
+    .forEach(a => {
+      const o = document.createElement("option");
+      o.value = a.id; o.dataset.platform = a.platform;
+      o.textContent = `${a.name || a.app_id} · ${a.platform} · ${a.app_id}`;
+      if (prev && String(a.id) === String(prev)) o.selected = true;
+      sel.appendChild(o);
+    });
+  // If the previously-chosen app is now hidden (account/search changed), reset.
+  const stillVisible = ALL_APPS.some(a => String(a.id)===String(prev) && selectedAccounts.has(a.publisher));
+  if (prev && !stillVisible){
+    state.app_id=null; state.app_label=""; state.platform=""; state.ad_units=[];
+    const astep = $("#adunit-step"); if (astep) astep.style.display="none";
+    updatePreview();
+  }
+}
+
+(function(){
+  const as = $("#account-search"); if (as) as.addEventListener("input", renderAccounts);
+  const aps = $("#app-search"); if (aps) aps.addEventListener("input", renderAppOptions);
+  renderAccounts(); renderAppOptions();
+})();
+
 $("#app-select").addEventListener("change", e => {
   state.app_id = e.target.value || null;
   const opt = e.target.options[e.target.selectedIndex];
@@ -2012,8 +2710,6 @@ $("#country-paste").addEventListener("change", e => {
   renderCountries(); updatePreview();
 });
 $("#line-count").addEventListener("change", e => { state.line_count = Math.max(1, Math.min(MAX_LINES, +e.target.value || DEFAULT_LINES)); updatePreview(); if (state.report) renderReport(); });
-$("#floor-type").addEventListener("change", e => { state.floor_type = e.target.value; updatePreview(); });
-$("#unique-names").addEventListener("change", e => { state.unique_names = e.target.checked; updatePreview(); });
 $("#name-prefix").addEventListener("input", e => { state.name_prefix = e.target.value || "Group"; updatePreview(); });
 
 $("#fetch-report-btn").addEventListener("click", async () => {
@@ -2023,12 +2719,18 @@ $("#fetch-report-btn").addEventListener("click", async () => {
     const ad_unit_ids = state.ad_units.map(u => u.ad_unit_id);
     const res = await fetch("/mediation/builder/fetch-report", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ ad_unit_ids }),
+      body: JSON.stringify({
+        ad_unit_ids,
+        country_mode: state.country_mode,
+        countries: [...state.countries],
+      }),
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.detail || "Fetch failed");
     state.report = data.report || {};
-    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days)`;
+    const geo = (data.countries && data.countries.length)
+      ? `Geo: ${data.countries.join(", ")}` : "Geo: Global (all countries)";
+    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo}`;
     renderReport();
     $("#report-section").style.display = "";
     $("#report-section").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2041,11 +2743,18 @@ $("#fetch-report-btn").addEventListener("click", async () => {
 
 function fmtPct(n) { return (n * 100).toFixed(2) + "%"; }
 function fmtUSD(n) { return "$" + (n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+const TIER_MULTIPLIERS = {{ tier_multipliers|tojson }};
+const MIN_ECPM = {{ min_ecpm }};
+const MAX_ECPM = {{ max_ecpm }};
+
 function computeLines(avg, count) {
-  const TOP = {{ top_mult }}, STEP = {{ step_factor }};
-  let v = avg * TOP, out = [];
-  for (let i = 0; i < count; i++) { out.push(+v.toFixed(2)); v *= STEP; }
-  return out;
+  // V1 = highest (top), VN = lowest (bottom). Pick first `count` multipliers.
+  // Each tier = base × Vx multiplier, clamped to [MIN_ECPM, MAX_ECPM].
+  return TIER_MULTIPLIERS.slice(0, Math.min(count, TIER_MULTIPLIERS.length))
+    .map(m => {
+      const v = avg * m;
+      return +Math.min(MAX_ECPM, Math.max(MIN_ECPM, v)).toFixed(2);
+    });
 }
 
 function renderReport() {
@@ -2194,8 +2903,16 @@ async function submitGroups(endpoint, label) {
       } else {
         msg = `Saved ${data.groups.length} draft group(s) locally (not pushed to AdMob).`;
       }
+      // Stay on the Builder so the same app + ad units remain selected. This
+      // lets the user create another country-level group for the SAME app
+      // without re-selecting everything: just change the country above,
+      // Fetch Report again (now geo-scoped), and push.
+      msg += `\n\n────────────────────\n` +
+             `You're still on the Builder — your app & ad units stay selected.\n` +
+             `To make another country's group for this app: change the country\n` +
+             `above → Fetch Report again → push. Open /mediation to view all groups.`;
       alert(msg);
-      window.location = "/mediation";
+      btn.disabled = false; btn.textContent = orig;
     } catch (err) {
       alert("Error: " + err.message);
       btn.disabled = false; btn.textContent = orig;
@@ -2287,123 +3004,6 @@ document.getElementById("push-existing-btn").addEventListener("click", async () 
     btn.disabled = false; btn.textContent = orig;
   }
 });
-
-// ============================================================
-// AdMob internal-API path — the backend creates real AdMob Network
-// waterfall lines using the user's saved admob.google.com session.
-// The checkbox reveals a session-paste panel + a push button.
-// ============================================================
-function refreshSessionStatus(saved, at) {
-  const el = document.getElementById("session-status");
-  if (!el) return;
-  el.innerHTML = saved
-    ? '<span class="pill pill-good">AdMob session saved</span> ' +
-      (at ? '<span class="muted">updated ' + at + '</span>' : '')
-    : '<span class="pill">No AdMob session saved yet</span>';
-}
-refreshSessionStatus(ADMOB_SESSION_SAVED, ADMOB_SESSION_AT);
-
-const __useInternalApiCb = $("#use-internal-api");
-if (__useInternalApiCb) {
-  __useInternalApiCb.addEventListener("change", e => {
-    state.use_internal_api = e.target.checked;
-    const panel = document.getElementById("internal-api-panel");
-    const acts = document.getElementById("internal-actions");
-    if (panel) panel.style.display = e.target.checked ? "" : "none";
-    if (acts) acts.style.display = e.target.checked ? "" : "none";
-  });
-}
-
-const __saveSessionBtn = document.getElementById("save-session-btn");
-if (__saveSessionBtn) {
-  __saveSessionBtn.addEventListener("click", async () => {
-    const curl = (document.getElementById("session-curl").value || "").trim();
-    if (!curl) { alert("Paste your AdMob cURL first."); return; }
-    __saveSessionBtn.disabled = true;
-    const orig = __saveSessionBtn.textContent;
-    __saveSessionBtn.textContent = "Saving...";
-    try {
-      const res = await fetch("/mediation/builder/save-admob-session", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ curl }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Save failed");
-      refreshSessionStatus(true, data.saved_at);
-      document.getElementById("session-curl").value = "";
-      alert("AdMob session saved (cookie length " + data.cookie_len + "). " +
-            "It will be reused on every run until it expires.");
-    } catch (err) {
-      alert("Could not save session:\n\n" + err.message);
-    } finally {
-      __saveSessionBtn.disabled = false;
-      __saveSessionBtn.textContent = orig;
-    }
-  });
-}
-
-const __internalPushBtn = document.getElementById("internal-push-btn");
-if (__internalPushBtn) {
-  __internalPushBtn.addEventListener("click", async () => {
-    const items = state.ad_units.map(u => {
-      const lines = $$(`.line-input[data-au="${u.ad_unit_id}"]`)
-        .map(i => +i.value || 0);
-      return {
-        ad_unit_id: u.ad_unit_id, ad_unit_name: u.name,
-        ad_format: u.ad_format,
-        metrics: (state.report || {})[u.ad_unit_id] || {},
-        lines,
-      };
-    });
-    const total = items.reduce((s, it) => s + it.lines.filter(l => l > 0).length, 0);
-    if (!items.length || !total) {
-      alert("Select ad units and make sure their tier eCPMs are filled.");
-      return;
-    }
-    if (!confirm("Create real AdMob Network waterfall groups via the internal API?\n\n" +
-        "• " + items.length + " mediation group(s)\n" +
-        "• " + total + " waterfall tier line(s) total\n\n" +
-        "This writes directly to your AdMob account. Continue?")) return;
-    __internalPushBtn.disabled = true;
-    const orig = __internalPushBtn.textContent;
-    __internalPushBtn.textContent = "Creating... (may take a minute)";
-    const out = document.getElementById("internal-result");
-    out.style.display = ""; out.textContent = "Working...";
-    try {
-      const res = await fetch("/mediation/builder/push-internal", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          app_id: state.app_id, name_prefix: state.name_prefix,
-          unique_names: state.unique_names, items,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || "Request failed");
-      let msg = "";
-      (data.results || []).forEach(r => {
-        msg += (r.ok ? "OK    " : "FAIL  ") + r.group + "\n";
-        if (r.group_id) msg += "      AdMob group id: " + r.group_id + "\n";
-        (r.log || []).forEach(l => { msg += "      " + l + "\n"; });
-        if (r.error) msg += "      ERROR: " + r.error + "\n";
-        msg += "\n";
-      });
-      if (data.session_expired) {
-        msg += ">>> Your AdMob session expired. Paste a fresh cURL in the " +
-               "panel above, save it, then retry.\n";
-      }
-      out.textContent = msg || "No results returned.";
-      const okCount = (data.results || []).filter(r => r.ok).length;
-      if (okCount && !data.session_expired) {
-        alert(okCount + " group(s) created. Refresh AdMob → Mediation to confirm.");
-      }
-    } catch (err) {
-      out.textContent = "Error: " + err.message;
-    } finally {
-      __internalPushBtn.disabled = false;
-      __internalPushBtn.textContent = orig;
-    }
-  });
-}
 
 updatePreview();
 </script>
@@ -2559,6 +3159,364 @@ document.querySelectorAll(".net-tab").forEach(t => t.addEventListener("click", (
 {% endif %}
 {% endblock %}"""
 
+TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
+{% block title %}Bidding · Mediation Tool{% endblock %}
+{% block content %}
+<section class="page-head">
+  <p class="eyebrow">Bidding setup</p>
+  <h1 class="display">3rd-party bidding networks</h1>
+  <p class="lede">For each <b>app</b> + <b>network</b> + <b>ad format</b>, you fill the mapping <b>once</b> and pick which ad unit it applies to. Each (network, format) → one mapping. When the builder's "Include All Bidding Networks" is on AND the pushed source ad unit matches this mapping's ad unit, it becomes a LIVE bidding line on the mediation group.</p>
+</section>
+
+{% if not apps %}
+<div class="empty">
+  <p>No apps cached yet. <form method="post" action="/apps/sync" style="display:inline"><button class="btn-primary" type="submit">↻ Sync from AdMob</button></form></p>
+</div>
+{% else %}
+
+<div class="bid-wizard">
+  <!-- App selector -->
+  <div class="bid-app-pick">
+    <label class="bid-app-label">
+      <span class="lbl">Select App</span>
+      <select id="bid-app-select">
+        {% for a in apps %}<option value="{{ a.id }}">{{ a.name or a.app_id }} — {{ a.platform }} — {{ a.app_id }}</option>{% endfor %}
+      </select>
+    </label>
+  </div>
+
+  {% for a in apps %}
+  {% set summary = saved_summary.get(a.id, {"count":0, "enabled":0, "updated":""}) %}
+  <div class="bid-app-block" data-app="{{ a.id }}">
+
+    <!-- Saved-data status banner — auto-loaded from your local database -->
+    <div class="bid-loaded-banner {% if summary.count > 0 %}has-saved{% endif %}">
+      {% if summary.count > 0 %}
+        <span class="bid-loaded-pill">📦 {{ summary.count }} saved configuration{{ '' if summary.count==1 else 's' }} loaded</span>
+        <span class="muted small">{{ summary.enabled }} enabled · last updated {{ summary.updated }}</span>
+        <span class="bid-db-info muted small">Database: <code>{{ db_url.split('///')[-1] if '///' in db_url else db_url }}</code> · encrypted (AES-256-GCM)</span>
+      {% else %}
+        <span class="bid-loaded-pill bid-loaded-empty">No saved configurations yet — starting fresh</span>
+        <span class="bid-db-info muted small">Will save to <code>{{ db_url.split('///')[-1] if '///' in db_url else db_url }}</code></span>
+      {% endif %}
+    </div>
+
+    <!-- AUTO-CHECK: existing mediation groups for this app, per format -->
+    <section class="bid-existing-card">
+      <header class="bid-existing-head">
+        <h3>Existing Mediation Groups</h3>
+        <p class="muted small" style="margin:4px 0 0">Auto-fetched from your AdMob account for this app. "Mediation group not found" = nothing exists yet for that format, push will create new.</p>
+      </header>
+      <div class="bid-existing-grid" data-app="{{ a.id }}">
+        <div class="bid-existing-loading muted small">Loading from AdMob…</div>
+      </div>
+    </section>
+
+    <!-- STEP 1: Format Support Summary -->
+    <section class="bid-step-card">
+      <header class="bid-step-head">
+        <h3>Step 1: Format Support Summary</h3>
+        <p class="muted small">Select which ad sources you want to enable for each ad format. Tap a chip to toggle.</p>
+      </header>
+
+      {% for fmt in formats %}
+        {% set supporting = [] %}
+        {% for net in networks %}{% if fmt in (net.supports_formats or []) %}{% set _ = supporting.append(net) %}{% endif %}{% endfor %}
+        {% set selected = namespace(c=0) %}
+        {% for net in supporting %}
+          {% set m = mappings.get((a.id, net.code, fmt)) %}
+          {% if m and m.enabled %}{% set selected.c = selected.c + 1 %}{% endif %}
+        {% endfor %}
+        <div class="bid-fmt-summary">
+          <header>
+            <span class="bid-fmt-label">{{ fmt }}</span>
+            <span class="bid-count {% if selected.c > 0 %}is-on{% endif %}">{{ selected.c }} selected</span>
+          </header>
+          <div class="bid-chips">
+            {% if supporting %}
+              {% for net in supporting %}
+                {% set m = mappings.get((a.id, net.code, fmt), {"enabled": false}) %}
+                <a class="bid-chip {% if m.enabled %}is-on{% endif %}" data-target="bid-form-{{ a.id }}-{{ net.code }}-{{ fmt }}" href="#bid-form-{{ a.id }}-{{ net.code }}-{{ fmt }}">{{ net.name }}</a>
+              {% endfor %}
+            {% else %}
+              <span class="muted small">No ad networks available for this format</span>
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </section>
+
+    <!-- STEP 2: Configure Ad Units -->
+    <section class="bid-step-card">
+      <header class="bid-step-head">
+        <h3>Step 2: Configure Ad Units</h3>
+        <p class="muted small">Enter the required configuration values for selected ad sources. Each (network × format) is one mapping — pick the ad unit it applies to and fill the network's values.</p>
+      </header>
+
+      {% for fmt in formats %}
+        {% set supporting = [] %}
+        {% for net in networks %}{% if fmt in (net.supports_formats or []) %}{% set _ = supporting.append(net) %}{% endif %}{% endfor %}
+        {% if supporting %}
+          {% set fmt_units = units_by_app_format.get((a.id, fmt), []) %}
+          {% set has_enabled = namespace(b=false) %}
+          {% for net in supporting %}
+            {% set m = mappings.get((a.id, net.code, fmt)) %}
+            {% if m and m.enabled %}{% set has_enabled.b = true %}{% endif %}
+          {% endfor %}
+          <details class="bid-fmt-section" {% if has_enabled.b %}open{% endif %}>
+            <summary>
+              <span class="bid-fmt-label">{{ fmt }}</span>
+              <span class="bid-section-badge">{{ supporting|length }} networks</span>
+            </summary>
+            <div class="bid-fmt-section-body">
+              {% if not fmt_units %}
+                <p class="muted small" style="padding:6px 0">No <b>{{ fmt }}</b> ad units in this app. Sync /apps or create some in AdMob first.</p>
+              {% endif %}
+              {% for net in supporting %}
+                {% set m = mappings.get((a.id, net.code, fmt), {"enabled": false, "ad_unit_id": "", "fields": {}}) %}
+                <div id="bid-form-{{ a.id }}-{{ net.code }}-{{ fmt }}" class="bid-net-form {% if m.enabled %}is-on{% endif %}" data-network="{{ net.code }}" data-format="{{ fmt }}">
+                  <header class="bid-net-form-head">
+                    <label class="bid-net-toggle-wrap">
+                      <span class="bidding-toggle">
+                        <input type="checkbox" name="enabled" {% if m.enabled %}checked{% endif %} />
+                        <span class="bidding-slider"></span>
+                      </span>
+                      <span class="bid-net-name-big">{{ net.name }}</span>
+                    </label>
+                    <span class="muted small">Configuration</span>
+                  </header>
+                  <div class="bid-net-grid">
+                    {# Auto-pick the first ad unit of this format when no saved selection #}
+                    {% set default_au = fmt_units[0].ad_unit_id if fmt_units else '' %}
+                    {% set picked_au = m.ad_unit_id or default_au %}
+                    <label>
+                      <span class="lbl">Ad Unit ID <span class="muted small" style="font-weight:400">(auto-picked)</span></span>
+                      <select name="ad_unit_id">
+                        <option value="" {% if not picked_au %}selected{% endif %}>— None —</option>
+                        {% for u in fmt_units %}
+                          <option value="{{ u.ad_unit_id }}" {% if picked_au == u.ad_unit_id %}selected{% endif %}>{{ u.name }} ({{ u.ad_unit_id.split('/')[-1] }})</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    {% set total_fields = (net.app_fields or []) + (net.ad_unit_fields or []) %}
+                    {% for f in total_fields %}
+                      <label>
+                        <span class="lbl">{{ f.label }}</span>
+                        <input name="{{ f.key }}" type="{{ f.type }}" value="{{ m.fields.get(f.key, '') }}" placeholder="{{ f.help }}" />
+                      </label>
+                    {% endfor %}
+                  </div>
+                  {% if not total_fields %}
+                    <p class="muted small" style="margin:8px 0 0">{{ net.name }} needs no extra fields — AdMob handles its config internally.</p>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            </div>
+          </details>
+        {% endif %}
+      {% endfor %}
+    </section>
+
+    <!-- JSON Preview -->
+    <section class="bid-step-card bid-preview-card">
+      <header class="bid-preview-head">
+        <div>
+          <h3>JSON Preview</h3>
+          <p class="muted small" style="margin:4px 0 0">Review the configuration before saving</p>
+        </div>
+        <button type="button" class="btn-secondary btn-sm bid-preview-toggle">Show Preview</button>
+      </header>
+      <pre class="bid-preview-json" style="display:none"></pre>
+    </section>
+
+    <!-- Confirm + Save All -->
+    <section class="bid-confirm-card">
+      <label class="bid-confirm">
+        <input type="checkbox" class="bid-confirm-cb" />
+        <span><strong>I confirm</strong> this configuration will be saved. Please review the configuration above before proceeding.</span>
+      </label>
+      <button type="button" class="btn-primary btn-lg bid-save-all" disabled>
+        💾  Save Bidding Configurations
+      </button>
+      <div class="bid-save-result muted small"></div>
+    </section>
+
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+const appSel = document.getElementById('bid-app-select');
+const FORMATS = {{ formats|tojson }};
+const _checkedApps = new Set();
+
+function showApp() {
+  const id = appSel.value;
+  document.querySelectorAll('.bid-app-block').forEach(b => {
+    b.style.display = (b.dataset.app === id) ? '' : 'none';
+  });
+  // Lazy-fetch existing mediation groups for the newly visible app
+  if (id && !_checkedApps.has(id)) {
+    _checkedApps.add(id);
+    fetchExistingGroups(id);
+  }
+}
+appSel.addEventListener('change', showApp);
+showApp();
+
+async function fetchExistingGroups(appId) {
+  const grid = document.querySelector(`.bid-existing-grid[data-app="${appId}"]`);
+  if (!grid) return;
+  grid.innerHTML = '<div class="bid-existing-loading muted small">Loading from AdMob…</div>';
+  try {
+    const res = await fetch(`/bidding/${appId}/check-groups`);
+    if (!res.ok) {
+      const txt = await res.text();
+      grid.innerHTML = `<div class="muted small" style="color:var(--bad)">Could not fetch: ${txt.slice(0,200)}</div>`;
+      return;
+    }
+    const data = await res.json();
+    let html = '';
+    FORMATS.forEach(fmt => {
+      const groups = (data.by_format || {})[fmt] || [];
+      const hasGroups = groups.length > 0;
+      html += `
+        <div class="bid-existing-row ${hasGroups ? 'has-groups' : 'no-groups'}">
+          <div class="bid-existing-fmt">${fmt}</div>
+          <div class="bid-existing-status">
+            ${hasGroups
+              ? groups.map(g => `<span class="bid-existing-pill ${g.state === 'ENABLED' ? 'on' : 'off'}">${escapeHtml(g.name)} <span class="muted">· ${g.line_count} lines · ${g.state || '—'}</span></span>`).join('')
+              : `<span class="bid-not-found">Mediation group not found</span>`}
+          </div>
+        </div>`;
+    });
+    grid.innerHTML = html;
+  } catch (err) {
+    grid.innerHTML = `<div class="muted small" style="color:var(--bad)">Error: ${err.message}</div>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// Step 1 chip → toggles the corresponding Step 2 form's enable checkbox + scrolls
+document.querySelectorAll('.bid-chip').forEach(chip => {
+  chip.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(chip.dataset.target);
+    if (!target) return;
+    const cb = target.querySelector('input[name=enabled]');
+    if (cb) {
+      cb.checked = !cb.checked;
+      target.classList.toggle('is-on', cb.checked);
+      chip.classList.toggle('is-on', cb.checked);
+      // Update the format's "X selected" count
+      updateFormatCount(chip.closest('.bid-fmt-summary'));
+    }
+    const det = target.closest('details'); if (det) det.open = true;
+    target.scrollIntoView({behavior: 'smooth', block: 'center'});
+  });
+});
+
+function updateFormatCount(summary) {
+  if (!summary) return;
+  const chips = summary.querySelectorAll('.bid-chip');
+  const onCount = [...chips].filter(c => c.classList.contains('is-on')).length;
+  const badge = summary.querySelector('.bid-count');
+  if (badge) {
+    badge.textContent = `${onCount} selected`;
+    badge.classList.toggle('is-on', onCount > 0);
+  }
+}
+
+// Form toggle ↔ chip visual sync
+document.querySelectorAll('.bid-net-form input[name=enabled]').forEach(cb => {
+  cb.addEventListener('change', e => {
+    const form = e.target.closest('.bid-net-form');
+    form.classList.toggle('is-on', e.target.checked);
+    const chip = document.querySelector('.bid-chip[data-target="' + form.id + '"]');
+    if (chip) {
+      chip.classList.toggle('is-on', e.target.checked);
+      updateFormatCount(chip.closest('.bid-fmt-summary'));
+    }
+  });
+});
+
+// === Bulk collect → JSON Preview + Save All ===
+function currentAppId() { return appSel.value; }
+
+function collectMappings() {
+  const block = document.querySelector(`.bid-app-block[data-app="${currentAppId()}"]`);
+  if (!block) return [];
+  return [...block.querySelectorAll('.bid-net-form')].map(form => {
+    const fields = {};
+    form.querySelectorAll('.bid-net-grid input').forEach(inp => {
+      if (inp.name && inp.name !== 'enabled' && inp.name !== 'ad_unit_id') {
+        fields[inp.name] = inp.value || '';
+      }
+    });
+    return {
+      network: form.dataset.network,
+      format: form.dataset.format,
+      enabled: form.querySelector('input[name=enabled]')?.checked || false,
+      ad_unit_id: form.querySelector('select[name=ad_unit_id]')?.value || '',
+      fields,
+    };
+  });
+}
+
+// JSON Preview toggle (per app block — there are many, the visible one wins)
+document.querySelectorAll('.bid-preview-toggle').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const pre = btn.closest('.bid-preview-card').querySelector('.bid-preview-json');
+    const open = pre.style.display !== 'none';
+    if (open) { pre.style.display = 'none'; btn.textContent = 'Show Preview'; }
+    else {
+      pre.style.display = '';
+      pre.textContent = JSON.stringify(collectMappings(), null, 2);
+      btn.textContent = 'Hide Preview';
+    }
+  });
+});
+
+// Confirm checkbox gates Save All
+document.querySelectorAll('.bid-confirm-cb').forEach(cb => {
+  cb.addEventListener('change', e => {
+    const card = e.target.closest('.bid-confirm-card');
+    card.querySelector('.bid-save-all').disabled = !e.target.checked;
+  });
+});
+
+// Save All — POST mappings to /bidding/{app}/save-all
+document.querySelectorAll('.bid-save-all').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const out = btn.closest('.bid-confirm-card').querySelector('.bid-save-result');
+    const items = collectMappings();
+    if (!items.length) { out.textContent = 'No items to save.'; return; }
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = 'Saving...';
+    try {
+      const res = await fetch(`/bidding/${currentAppId()}/save-all`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mappings: items}),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Save failed');
+      out.innerHTML = `<span style="color:var(--good)">✓ Saved ${data.saved} mapping(s) (${data.enabled} enabled) to database. They will auto-load next time.</span>`;
+    } catch (err) {
+      out.innerHTML = `<span style="color:var(--bad)">✗ ${err.message}</span>`;
+    } finally {
+      btn.textContent = orig;
+      btn.disabled = !btn.closest('.bid-confirm-card').querySelector('.bid-confirm-cb').checked;
+    }
+  });
+});
+</script>
+{% endif %}
+{% endblock %}"""
+
 CSS_CONTENT = r""":root {
   --bg: #0e0d0b; --bg-2: #16140f; --bg-3: #1d1a14;
   --line: #2a261d; --line-2: #3a3326;
@@ -2657,7 +3615,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .status-push_failed { color: var(--bad); background: rgba(226,112,91,0.14); }
 label { display: flex; flex-direction: column; gap: 6px; }
 .lbl { color: var(--ink-dim); font-size: 12.5px; }
-input[type="text"], input[type="number"], input[type="password"], input:not([type]), select, textarea { background: var(--bg-3); color: var(--ink); border: 1px solid var(--line-2); border-radius: var(--radius); padding: 9px 12px; font: 400 14px/1.3 var(--font-body); }
+input[type="text"], input[type="number"], input[type="password"], input:not([type]), select, textarea { background: var(--bg-3); color: var(--ink); border: 1px solid var(--line-2); border-radius: var(--radius); padding: 9px 12px; font: 400 14px/1.3 var(--font-body); color-scheme: dark; }
+select option { background: var(--bg-2); color: var(--ink); }
 input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(244,185,66,0.12); }
 .builder-grid { display: grid; grid-template-columns: 1.4fr 0.8fr; gap: 28px; align-items: start; }
 @media (max-width: 1000px) { .builder-grid { grid-template-columns: 1fr; } }
@@ -2722,6 +3681,105 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .actions-col { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .actions-col form { display: inline; }
 .forensic-block { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-dim); overflow-x: auto; max-height: 240px; }
+
+/* Bidding setup — ADFLUX-style wizard (Step 1 chips + Step 2 forms) */
+.bid-wizard { display: flex; flex-direction: column; gap: 18px; }
+
+.bid-app-pick { padding: 18px 20px; background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); }
+.bid-app-label { display: flex; flex-direction: column; gap: 6px; }
+.bid-app-label .lbl { font-size: 11px; color: var(--ink-mute); text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+.bid-app-label select { padding: 12px 14px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; color: var(--ink); font-size: 14px; cursor: pointer; width: 100%; }
+.bid-app-label select:focus { border-color: var(--accent); outline: none; }
+
+.bid-app-block { display: flex; flex-direction: column; gap: 18px; }
+
+.bid-step-card { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 22px 26px; }
+.bid-step-head { margin-bottom: 18px; }
+.bid-step-head h3 { font-size: 18px; font-weight: 600; color: var(--ink); margin: 0 0 4px; }
+.bid-step-head p { margin: 0; }
+
+.bid-fmt-summary { padding: 14px 0; border-bottom: 1px solid var(--line); }
+.bid-fmt-summary:last-child { border-bottom: none; }
+.bid-fmt-summary > header { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
+.bid-fmt-label { font-family: var(--font-mono); font-size: 13px; letter-spacing: 0.06em; color: var(--ink); font-weight: 600; }
+.bid-count { font-size: 11px; padding: 4px 10px; border-radius: 999px; background: var(--bg-3); color: var(--ink-mute); border: 1px solid var(--line); white-space: nowrap; }
+.bid-count.is-on { background: rgba(244,185,66,0.12); color: var(--accent); border-color: rgba(244,185,66,0.4); }
+.bid-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.bid-chip { display: inline-flex; padding: 8px 16px; border-radius: 999px; background: var(--bg-3); border: 1px solid var(--line); color: var(--ink-dim); font-size: 13px; cursor: pointer; transition: all 0.15s; user-select: none; font-weight: 500; }
+.bid-chip:hover { border-color: rgba(244,185,66,0.4); color: var(--ink); }
+.bid-chip.is-on { background: var(--accent-2); border-color: var(--accent-2); color: white; }
+.bid-chip.is-on:hover { background: var(--accent); border-color: var(--accent); color: white; }
+
+.bid-fmt-section { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 12px; overflow: hidden; }
+.bid-fmt-section > summary { cursor: pointer; padding: 14px 18px; display: flex; align-items: center; justify-content: space-between; gap: 12px; list-style: none; transition: background 0.15s; }
+.bid-fmt-section > summary::-webkit-details-marker { display: none; }
+.bid-fmt-section > summary:hover { background: var(--bg-2); }
+.bid-fmt-section[open] > summary { border-bottom: 1px solid var(--line); }
+.bid-fmt-section-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
+
+.bid-net-form { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; transition: border-color 0.2s, background 0.2s; display: flex; flex-direction: column; gap: 12px; }
+.bid-net-form.is-on { border-color: rgba(244,185,66,0.45); background: rgba(244,185,66,0.03); }
+.bid-net-form-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.bid-net-toggle-wrap { display: flex; align-items: center; gap: 12px; cursor: pointer; user-select: none; }
+.bid-net-name-big { font-weight: 600; color: var(--ink); font-size: 15px; }
+.bid-net-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.bid-net-grid label { display: flex; flex-direction: column; gap: 4px; }
+.bid-net-grid .lbl { font-size: 11px; color: var(--ink-mute); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500; }
+.bid-net-grid input, .bid-net-grid select { width: 100%; padding: 10px 12px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; color: var(--ink); font-size: 13px; font-family: var(--font-mono); }
+.bid-net-grid input:focus, .bid-net-grid select:focus { border-color: var(--accent); outline: none; }
+.bid-net-form-foot { display: flex; justify-content: flex-end; padding-top: 8px; border-top: 1px dashed var(--line); }
+
+.bid-section-badge { font-size: 11px; padding: 4px 10px; border-radius: 999px; background: var(--bg-2); color: var(--ink-mute); border: 1px solid var(--line); white-space: nowrap; }
+.bid-preview-card { padding: 18px 22px; }
+.bid-preview-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.bid-preview-head h3 { font-size: 16px; font-weight: 600; color: var(--ink); margin: 0; }
+.bid-preview-json { background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-top: 14px; max-height: 360px; overflow: auto; font-family: var(--font-mono); font-size: 12px; color: var(--ink-dim); }
+
+.bid-confirm-card { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 22px; display: flex; flex-direction: column; gap: 16px; }
+.bid-confirm { display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px; background: rgba(244,185,66,0.06); border: 1px solid rgba(244,185,66,0.25); border-radius: 8px; cursor: pointer; user-select: none; }
+.bid-confirm input { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
+.bid-confirm span { font-size: 13px; color: var(--ink); line-height: 1.5; }
+.bid-save-all { width: 100%; padding: 14px 20px; font-size: 15px; font-weight: 600; background: var(--accent-2); border: 1px solid var(--accent-2); color: white; border-radius: var(--radius); cursor: pointer; transition: all 0.15s; display: flex; align-items: center; justify-content: center; gap: 10px; }
+.bid-save-all:hover:not(:disabled) { background: var(--accent); border-color: var(--accent); }
+.bid-save-all:disabled { opacity: 0.4; cursor: not-allowed; }
+.bid-save-result { text-align: center; }
+
+/* Existing mediation groups auto-check panel */
+.bid-existing-card { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 22px; }
+.bid-existing-head { margin-bottom: 14px; }
+.bid-existing-head h3 { font-size: 16px; font-weight: 600; color: var(--ink); margin: 0; display: flex; align-items: center; gap: 8px; }
+.bid-existing-head h3::before { content: "🔍"; font-size: 14px; }
+.bid-existing-grid { display: flex; flex-direction: column; gap: 8px; }
+.bid-existing-loading { padding: 12px 0; }
+.bid-existing-row { display: grid; grid-template-columns: 140px 1fr; align-items: center; gap: 16px; padding: 10px 14px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 6px; }
+.bid-existing-row.has-groups { border-color: rgba(127,182,133,0.3); background: rgba(127,182,133,0.04); }
+.bid-existing-fmt { font-family: var(--font-mono); font-size: 13px; letter-spacing: 0.04em; color: var(--ink); font-weight: 600; }
+.bid-existing-status { display: flex; flex-wrap: wrap; gap: 6px; }
+.bid-existing-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--bg-2); border: 1px solid var(--line); color: var(--ink); }
+.bid-existing-pill.on { border-color: rgba(127,182,133,0.4); color: var(--good); }
+.bid-existing-pill.off { color: var(--ink-mute); }
+.bid-not-found { font-size: 12px; color: var(--ink-mute); font-style: italic; }
+
+/* "Saved configurations loaded" status banner */
+.bid-loaded-banner { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px; font-size: 13px; }
+.bid-loaded-banner.has-saved { border-color: rgba(127,182,133,0.35); background: rgba(127,182,133,0.05); }
+.bid-loaded-pill { padding: 4px 12px; border-radius: 999px; background: rgba(127,182,133,0.15); border: 1px solid rgba(127,182,133,0.4); color: var(--good); font-weight: 600; font-size: 12px; }
+.bid-loaded-pill.bid-loaded-empty { background: var(--bg-2); border-color: var(--line); color: var(--ink-mute); font-weight: 500; }
+.bid-db-info { margin-left: auto; }
+.bid-db-info code { font-family: var(--font-mono); background: var(--bg-2); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--line); }
+
+/* Builder: "Include All Bidding Networks" callout + iOS-style toggle */
+.bidding-callout { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 18px; margin: 14px 0; transition: border-color 0.2s, background 0.2s; }
+.bidding-callout.is-on { border-color: rgba(244,185,66,0.5); background: rgba(244,185,66,0.06); }
+.bidding-callout-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
+.bidding-callout-head > div { flex: 1; }
+.bidding-callout-head strong { font-size: 14px; color: var(--ink); }
+.bidding-toggle { position: relative; display: inline-block; width: 48px; height: 26px; flex-shrink: 0; cursor: pointer; }
+.bidding-toggle input { opacity: 0; width: 0; height: 0; }
+.bidding-slider { position: absolute; inset: 0; background: var(--bg-2); border: 1px solid var(--line); border-radius: 999px; transition: background 0.2s, border-color 0.2s; }
+.bidding-slider::before { content: ""; position: absolute; left: 3px; top: 3px; width: 18px; height: 18px; background: var(--ink-mute); border-radius: 50%; transition: transform 0.2s, background 0.2s; }
+.bidding-toggle input:checked + .bidding-slider { background: var(--accent); border-color: var(--accent); }
+.bidding-toggle input:checked + .bidding-slider::before { transform: translateX(22px); background: white; }
 """
 
 
@@ -2785,11 +3843,32 @@ Base.metadata.create_all(bind=engine)
 _auto_migrate_sqlite()
 
 
-BUILD_TAG = "waterfall-3p-networks-admob-bidding-v7"
+BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
+
+# Values that must never be used as a real secret.
+_WEAK_SECRETS = {"", "change-me-in-env", "secret", "changeme", "password"}
+
+
+def _enforce_secret_key() -> None:
+    """secret_key signs sessions AND derives the AES-256 key for every stored
+    token. A weak/default value would let anyone forge sessions and (with DB
+    access) decrypt credentials. Refuse to start in production; warn in dev."""
+    sk = (settings.secret_key or "").strip()
+    weak = sk in _WEAK_SECRETS or len(sk) < 16
+    if not weak:
+        return
+    msg = ("INSECURE secret_key: set a strong random value (>=32 chars) via the "
+           "SECRET_KEY env var. Generate one with:  "
+           "python -c \"import secrets; print(secrets.token_urlsafe(48))\"")
+    if settings.debug:
+        _log(f"  ⚠ WARNING — {msg}")
+    else:
+        raise RuntimeError(msg)
 
 
 @asynccontextmanager
 async def lifespan(_: "FastAPI"):
+    _enforce_secret_key()
     url = f"http://localhost:{settings.port}"
     try:
         mtime = datetime.fromtimestamp(
@@ -2826,14 +3905,45 @@ async def lifespan(_: "FastAPI"):
 # so we're not losing any debug info.
 app = FastAPI(title="AdMob Mediation Tool", debug=False, lifespan=lifespan)
 # same_site="lax" lets the session cookie survive the Google -> /auth/callback
-# top-level redirect; https_only=False is required for http://localhost dev.
+# top-level redirect. The cookie is always HttpOnly (JS can't read it) and is
+# signed with secret_key. In production set cookie_secure=true so it is only
+# ever sent over HTTPS; keep false for http://localhost dev.
 app.add_middleware(
     SessionMiddleware,
     secret_key=settings.secret_key,
     max_age=60 * 60 * 24 * 7,
     same_site="lax",
-    https_only=False,
+    https_only=settings.cookie_secure,
 )
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """Defense-in-depth response headers on every response."""
+    resp = await call_next(request)
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"               # anti-clickjacking
+    resp.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    resp.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+    # CSP: block external/injected scripts & framing. 'unsafe-inline' is kept
+    # because the templates rely on inline <style>/<script>; everything else is
+    # locked to same-origin (plus Google avatars in <img>).
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: https:; "
+        "connect-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'self'; "
+        "object-src 'none'"
+    )
+    # HSTS only matters over HTTPS (production).
+    if settings.cookie_secure:
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    return resp
+
+
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 app.state.templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
@@ -3040,12 +4150,15 @@ def dashboard(request: Request, db: Session = Depends(get_db), user: User = Depe
             publisher_id = AdMobClient(db, user).get_publisher_id()
         except AdMobAPIError as e:
             api_error = str(e)
-    app_count = db.query(AdMobApp).filter(AdMobApp.user_id == user.id).count()
+    apps = db.query(AdMobApp).filter(AdMobApp.user_id == user.id).all()
+    app_count = len(apps)
     group_count = db.query(MediationGroup).filter(MediationGroup.user_id == user.id).count()
+    accounts = _accounts_from_apps(apps)
     return tmpl(request).TemplateResponse("dashboard.html", {
         "request": request, "user": user,
         "publisher_id": publisher_id or "(not detected - click Sync Apps)",
         "app_count": app_count, "group_count": group_count, "api_error": api_error,
+        "accounts": accounts,
         "max_lines": WATERFALL_MAX_LINES,
     })
 
@@ -3062,16 +4175,53 @@ def list_apps_view(request: Request, db: Session = Depends(get_db), user: User =
     return tmpl(request).TemplateResponse("apps.html", {"request": request, "user": user, "apps": apps})
 
 
+def _publisher_of_app_id(app_id: str) -> str:
+    """Derive the publisher id from an AdMob appId/adUnitId.
+
+    `ca-app-pub-7823379550491034~2664862870` -> `pub-7823379550491034`
+    (works for ad unit ids `ca-app-pub-XXXX/YYYY` too). Used to scope sync to
+    a single AdMob account so other accounts' cached data is left intact."""
+    if "pub-" in app_id:
+        return "pub-" + app_id.split("pub-", 1)[1].split("~")[0].split("/")[0]
+    return ""
+
+
+def _accounts_from_apps(apps) -> list[dict]:
+    """Distinct AdMob accounts (publishers) present in the user's cached apps,
+    each with its app count. Drives the account selector on the dashboard and
+    builder. Sorted by publisher id for a stable order."""
+    counts: dict[str, int] = {}
+    for a in apps:
+        pub = _publisher_of_app_id(a.app_id) or "unknown"
+        counts[pub] = counts.get(pub, 0) + 1
+    return [{"publisher": p, "app_count": c} for p, c in sorted(counts.items())]
+
+
 @apps_router.post("/sync")
 def sync_apps(request: Request, db: Session = Depends(get_db), user: User = Depends(current_user)):
     try:
         client = AdMobClient(db, user)
+        current_pub = client.get_publisher_id()
         api_apps = client.list_apps()
         api_ad_units = client.list_ad_units()
     except AdMobAPIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     existing = {a.app_id: a for a in db.query(AdMobApp).filter(AdMobApp.user_id == user.id).all()}
     now = datetime.utcnow()
+    api_app_ids = {a.get("appId", "") for a in api_apps if a.get("appId")}
+    # ACCOUNT-SCOPED sync. The AdMob API only ever returns the publisher the
+    # user most recently signed into from the AdMob UI (accounts.list returns
+    # exactly that one). So we ONLY refresh apps belonging to `current_pub`,
+    # and leave apps from OTHER AdMob accounts the user has cached untouched —
+    # a user whose email can access several AdMob accounts keeps each one's
+    # data. We purge only CURRENT-account apps that AdMob no longer returns.
+    stale = [a for app_id, a in existing.items()
+             if _publisher_of_app_id(app_id) == current_pub and app_id not in api_app_ids]
+    for app_row in stale:
+        db.delete(app_row)
+    if stale:
+        db.commit()
+        existing = {a.app_id: a for a in db.query(AdMobApp).filter(AdMobApp.user_id == user.id).all()}
     for api_app in api_apps:
         admob_id = api_app.get("appId", "")
         platform = api_app.get("platform", "ANDROID")
@@ -3089,8 +4239,12 @@ def sync_apps(request: Request, db: Session = Depends(get_db), user: User = Depe
             row.last_synced_at = now
     db.commit()
     db_apps = {a.app_id: a for a in db.query(AdMobApp).filter(AdMobApp.user_id == user.id).all()}
-    for app_row in db_apps.values():
-        db.query(AdUnit).filter(AdUnit.app_id == app_row.id).delete()
+    # Refresh ad units ONLY for the current account's apps; other accounts'
+    # ad units stay as they were.
+    current_app_pks = [a.id for app_id, a in db_apps.items()
+                       if _publisher_of_app_id(app_id) == current_pub]
+    if current_app_pks:
+        db.query(AdUnit).filter(AdUnit.app_id.in_(current_app_pks)).delete(synchronize_session=False)
     for unit in api_ad_units:
         parent = db_apps.get(unit.get("appId", ""))
         if parent is None:
@@ -3099,6 +4253,32 @@ def sync_apps(request: Request, db: Session = Depends(get_db), user: User = Depe
                       name=unit.get("displayName", "") or unit.get("name", ""),
                       ad_format=unit.get("adFormat", "BANNER"), last_synced_at=now))
     db.commit()
+    # Cache the AdMob-side mediation groups too, so the Cleanup screen can
+    # list them instantly from the DB (sync once, browse fast). Account-scoped:
+    # only the current publisher's cached groups are refreshed. A failure here
+    # must not fail the whole sync — apps/ad units are already committed.
+    try:
+        api_groups = client.list_mediation_groups_in_admob()
+    except AdMobAPIError:
+        api_groups = None
+    if api_groups is not None:
+        db.query(AdMobMediationGroupCache).filter(
+            AdMobMediationGroupCache.user_id == user.id,
+            AdMobMediationGroupCache.publisher_id == current_pub,
+        ).delete(synchronize_session=False)
+        for g in api_groups:
+            db.add(AdMobMediationGroupCache(
+                user_id=user.id, publisher_id=current_pub,
+                group_id=g.get("mediation_group_id", ""),
+                display_name=g.get("display_name", ""),
+                platform=g.get("platform", ""),
+                ad_format=g.get("format", ""),
+                state=g.get("state", ""),
+                ad_unit_ids=g.get("ad_unit_ids", []) or [],
+                line_count=g.get("line_count", 0),
+                last_synced_at=now,
+            ))
+        db.commit()
     return RedirectResponse("/apps", status_code=303)
 
 
@@ -3201,6 +4381,208 @@ async def save_unit_creds(
 
 
 # ============================================================================
+# BIDDING ROUTES — per-(app, network, ad_unit_id) bidding mappings. Same UI
+# pattern as /networks but with an "enabled" toggle per ad-unit row. At
+# mediation-group push time, each enabled row becomes a real AdUnitMapping
+# on the source ad unit + a LIVE bidding line on the group (only when the
+# builder's "Include All Bidding Networks" toggle is on; default ON).
+# ============================================================================
+bidding_router = APIRouter(prefix="/bidding", tags=["bidding"])
+
+
+def _bidding_networks() -> list[dict]:
+    """3P networks that are eligible for bidding (skips AdMob Network)."""
+    return [n for n in NETWORK_CATALOG
+            if n.get("supports_bidding") and not n.get("internal_only")]
+
+
+@bidding_router.get("", response_class=HTMLResponse)
+def bidding_view(request: Request, db: Session = Depends(get_db),
+                 user: User = Depends(current_user)):
+    apps = db.query(AdMobApp).filter(
+        AdMobApp.user_id == user.id).order_by(AdMobApp.name).all()
+    # (app_id, network_code, ad_format) -> {enabled, ad_unit_id, fields}
+    mappings: dict[tuple, dict] = {}
+    for m in db.query(BiddingFormatMapping).filter(
+            BiddingFormatMapping.user_id == user.id).all():
+        mappings[(m.app_id, m.network_code, m.ad_format)] = {
+            "enabled": bool(m.enabled),
+            "ad_unit_id": m.ad_unit_id or "",
+            "fields": decrypt_dict(m.encrypted_fields),
+        }
+    # Group each app's ad units by format so the template can render a
+    # format-filtered dropdown without doing the work itself.
+    units_by_app_format: dict[tuple, list[dict]] = {}
+    for a in apps:
+        for u in a.ad_units:
+            key = (a.id, (u.ad_format or "").upper())
+            units_by_app_format.setdefault(key, []).append({
+                "ad_unit_id": u.ad_unit_id, "name": u.name or u.ad_unit_id,
+            })
+    # Per-app summary: how many bidding configs saved + most recent update
+    saved_summary: dict[int, dict] = {}
+    for a in apps:
+        count = enabled = 0
+        latest: datetime | None = None
+        for m in db.query(BiddingFormatMapping).filter(
+                BiddingFormatMapping.user_id == user.id,
+                BiddingFormatMapping.app_id == a.id).all():
+            count += 1
+            if m.enabled:
+                enabled += 1
+            if latest is None or (m.updated_at and m.updated_at > latest):
+                latest = m.updated_at
+        saved_summary[a.id] = {
+            "count": count, "enabled": enabled,
+            "updated": latest.strftime("%Y-%m-%d %H:%M") if latest else "",
+        }
+    return tmpl(request).TemplateResponse("bidding.html", {
+        "request": request, "user": user,
+        "apps": apps,
+        "networks": _bidding_networks(),
+        "formats": BIDDING_FORMATS,
+        "mappings": mappings,
+        "units_by_app_format": units_by_app_format,
+        "saved_summary": saved_summary,
+        "db_url": settings.database_url,
+    })
+
+
+@bidding_router.get("/{app_pk}/check-groups")
+def check_mediation_groups(
+    app_pk: int, db: Session = Depends(get_db),
+    user: User = Depends(current_user),
+):
+    """Auto-check AdMob for existing mediation groups targeting THIS app's
+    ad units, grouped by ad format. Returns "Mediation group not found"
+    semantics per-format (empty list) so the UI can show that exactly."""
+    app_row = db.query(AdMobApp).filter(
+        AdMobApp.id == app_pk, AdMobApp.user_id == user.id).first()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="App not found")
+    app_unit_ids = {u.ad_unit_id for u in app_row.ad_units}
+    by_format: dict[str, list[dict]] = {fmt: [] for fmt in BIDDING_FORMATS}
+    if not app_unit_ids:
+        return {"by_format": by_format, "total_ad_units": 0}
+    try:
+        client = AdMobClient(db, user)
+        groups = client.list_mediation_groups_in_admob()
+    except AdMobAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    # AdMob returns the format as "APP_OPEN_AD"; map back to our "APP_OPEN".
+    fmt_back = {"APP_OPEN_AD": "APP_OPEN"}
+    for g in groups:
+        gau_ids = set(g.get("ad_unit_ids", []) or [])
+        if not (gau_ids & app_unit_ids):
+            continue
+        fmt_raw = (g.get("format") or "").upper()
+        fmt = fmt_back.get(fmt_raw, fmt_raw)
+        if fmt not in by_format:
+            continue
+        by_format[fmt].append({
+            "id": g.get("mediation_group_id"),
+            "name": g.get("display_name") or "(unnamed)",
+            "state": g.get("state"),
+            "line_count": g.get("line_count", 0),
+        })
+    return {"by_format": by_format, "total_ad_units": len(app_unit_ids)}
+
+
+@bidding_router.post("/{app_pk}/save-all")
+async def save_all_bidding(
+    app_pk: int, payload: dict = Body(...),
+    db: Session = Depends(get_db), user: User = Depends(current_user),
+):
+    """ADFLUX-style bulk save — accepts every (network, format) row for an
+    app in one request and upserts BiddingFormatMapping rows. Payload:
+        {"mappings": [
+            {"network": "META", "format": "BANNER", "enabled": true,
+             "ad_unit_id": "ca-app-pub-XXX/YYY",
+             "fields": {"placement_id": "..."}},
+            ...
+        ]}
+    """
+    app_row = db.query(AdMobApp).filter(
+        AdMobApp.id == app_pk, AdMobApp.user_id == user.id).first()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="App not found")
+    items = payload.get("mappings") or []
+    saved = enabled_count = 0
+    for item in items:
+        net_code = str(item.get("network") or "").upper()
+        ad_fmt = str(item.get("format") or "").upper()
+        cat = NETWORK_BY_CODE.get(net_code)
+        if not cat or not cat.get("supports_bidding"):
+            continue
+        if ad_fmt not in BIDDING_FORMATS:
+            continue
+        is_enabled = bool(item.get("enabled"))
+        ad_unit_id = (item.get("ad_unit_id") or "").strip()
+        valid_keys = [f["key"] for f in (cat.get("app_fields") or [])] + \
+                     [f["key"] for f in (cat.get("ad_unit_fields") or [])]
+        raw_fields = item.get("fields") or {}
+        fields = {k: (raw_fields.get(k) or "").strip() for k in valid_keys}
+        row = db.query(BiddingFormatMapping).filter(
+            BiddingFormatMapping.user_id == user.id,
+            BiddingFormatMapping.app_id == app_pk,
+            BiddingFormatMapping.network_code == net_code,
+            BiddingFormatMapping.ad_format == ad_fmt,
+        ).first()
+        if row is None:
+            row = BiddingFormatMapping(
+                user_id=user.id, app_id=app_pk,
+                network_code=net_code, ad_format=ad_fmt)
+            db.add(row)
+        row.ad_unit_id = ad_unit_id
+        row.encrypted_fields = encrypt_dict(fields)
+        row.enabled = is_enabled
+        saved += 1
+        if is_enabled:
+            enabled_count += 1
+    db.commit()
+    return {"status": "ok", "saved": saved, "enabled": enabled_count}
+
+
+@bidding_router.post("/{app_pk}/{network_code}/{ad_format}/save")
+async def save_bidding_format(
+    app_pk: int, network_code: str, ad_format: str, request: Request,
+    db: Session = Depends(get_db), user: User = Depends(current_user),
+):
+    cat = NETWORK_BY_CODE.get(network_code.upper())
+    if not cat or not cat.get("supports_bidding"):
+        raise HTTPException(status_code=404, detail="Unknown bidding network")
+    if ad_format.upper() not in BIDDING_FORMATS:
+        raise HTTPException(status_code=400, detail="Invalid ad_format")
+    app_row = db.query(AdMobApp).filter(
+        AdMobApp.id == app_pk, AdMobApp.user_id == user.id).first()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="App not found")
+    form = await request.form()
+    enabled = (form.get("enabled") or "").lower() in ("on", "true", "1", "yes")
+    ad_unit_id = (form.get("ad_unit_id") or "").strip()
+    all_field_keys = [f["key"] for f in (cat.get("app_fields") or [])] + \
+                     [f["key"] for f in (cat.get("ad_unit_fields") or [])]
+    fields = {k: (form.get(k) or "").strip() for k in all_field_keys}
+    row = db.query(BiddingFormatMapping).filter(
+        BiddingFormatMapping.user_id == user.id,
+        BiddingFormatMapping.app_id == app_pk,
+        BiddingFormatMapping.network_code == cat["code"],
+        BiddingFormatMapping.ad_format == ad_format.upper(),
+    ).first()
+    if row is None:
+        row = BiddingFormatMapping(
+            user_id=user.id, app_id=app_pk,
+            network_code=cat["code"], ad_format=ad_format.upper())
+        db.add(row)
+    row.ad_unit_id = ad_unit_id
+    row.encrypted_fields = encrypt_dict(fields)
+    row.enabled = enabled
+    db.commit()
+    return RedirectResponse(
+        f"/bidding#app-{app_pk}", status_code=303)
+
+
+# ============================================================================
 # MEDIATION ROUTES
 # ============================================================================
 med_router = APIRouter(prefix="/mediation", tags=["mediation"])
@@ -3231,24 +4613,31 @@ def builder_view(request: Request, db: Session = Depends(get_db), user: User = D
             "created_at": g.created_at.strftime("%Y-%m-%d %H:%M") if g.created_at else "",
         })
 
-    sess_row = db.query(AdMobSession).filter(
-        AdMobSession.user_id == user.id).first()
-    admob_session_saved = bool(sess_row and sess_row.encrypted_blob)
-    admob_session_at = (sess_row.updated_at.strftime("%Y-%m-%d %H:%M")
-                        if sess_row and sess_row.updated_at else "")
+    # Apps grouped by AdMob account (publisher) so the builder can offer an
+    # account selector + per-account app filtering. The publisher is derived
+    # from each app's id (no schema change). Note: the AdMob API only ever
+    # returns ONE account at a time, but cached apps can span several accounts
+    # the user has synced — those are what the selector lists.
+    all_apps = [
+        {"id": a.id, "name": a.name, "app_id": a.app_id,
+         "platform": a.platform,
+         "publisher": _publisher_of_app_id(a.app_id) or "unknown"}
+        for a in apps
+    ]
+    accounts = _accounts_from_apps(apps)
 
     return tmpl(request).TemplateResponse("mediation_builder.html", {
         "request": request, "user": user, "apps": apps,
+        "all_apps": all_apps, "accounts": accounts,
         "ad_units_by_app": ad_units_by_app,
         "countries": COMMON_COUNTRIES,
         "max_lines": WATERFALL_MAX_LINES,
         "default_lines": WATERFALL_DEFAULT_LINES,
         "floor_types": FLOOR_TYPES,
-        "top_mult": WATERFALL_TOP_MULTIPLIER,
-        "step_factor": WATERFALL_STEP_FACTOR,
+        "tier_multipliers": WATERFALL_TIER_MULTIPLIERS,
+        "min_ecpm": WATERFALL_MIN_ECPM,
+        "max_ecpm": WATERFALL_MAX_ECPM,
         "existing_groups": existing_groups,
-        "admob_session_saved": admob_session_saved,
-        "admob_session_at": admob_session_at,
     })
 
 
@@ -3257,10 +4646,17 @@ def builder_fetch_report(payload: dict = Body(...), db: Session = Depends(get_db
     ad_unit_ids = payload.get("ad_unit_ids") or []
     if not ad_unit_ids:
         raise HTTPException(status_code=400, detail="No ad unit IDs supplied")
+    # Scope the report to the chosen geo. Only INCLUDE mode (specific countries)
+    # narrows the report; GLOBAL stays worldwide, and EXCLUDE can't be expressed
+    # by the AdMob report filter (match-any only), so it also stays global.
+    country_mode = (payload.get("country_mode") or "GLOBAL").upper()
+    raw_countries = [str(c).upper() for c in (payload.get("countries") or [])]
+    countries = raw_countries if (country_mode == "INCLUDE" and raw_countries) else []
     start, end = _days_ago_iso(6), _today_iso()
     try:
         client = AdMobClient(db, user)
-        report = client.fetch_network_report_for_ad_units(ad_unit_ids, start, end)
+        report = client.fetch_network_report_for_ad_units(
+            ad_unit_ids, start, end, countries=countries)
     except AdMobAPIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     for au in ad_unit_ids:
@@ -3269,7 +4665,8 @@ def builder_fetch_report(payload: dict = Body(...), db: Session = Depends(get_db
             "revenue_usd": 0.0, "ecpm_usd": 0.0, "rpm_usd": 0.0,
             "match_rate": 0.0, "show_rate": 0.0, "fill_rate": 0.0, "ctr": 0.0,
         })
-    return {"start": start, "end": end, "report": report}
+    return {"start": start, "end": end, "report": report,
+            "countries": countries, "scope": "GLOBAL" if not countries else "COUNTRY"}
 
 
 @med_router.post("/builder/generate")
@@ -3280,119 +4677,6 @@ def builder_generate(payload: dict = Body(...), db: Session = Depends(get_db), u
 @med_router.post("/builder/push-to-admob")
 def builder_push_to_admob(payload: dict = Body(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
     return _generate_groups(payload, db, user, push_to_admob=True)
-
-
-@med_router.post("/builder/save-admob-session")
-def builder_save_admob_session(payload: dict = Body(...),
-                               db: Session = Depends(get_db),
-                               user: User = Depends(current_user)):
-    """Store (encrypted) the user's admob.google.com session, parsed from a
-    pasted DevTools cURL. Used by the internal-API waterfall path."""
-    parsed = parse_admob_curl(payload.get("curl") or "")
-    if not parsed["cookie"]:
-        raise HTTPException(
-            status_code=400,
-            detail="No cookie found. In admob.google.com DevTools -> Network, "
-                   "right-click any request to a URL containing /rpc/ -> "
-                   "Copy -> Copy as cURL (bash), then paste the whole thing.")
-    if not parsed["xsrf"] or not parsed["f_sid"]:
-        raise HTTPException(
-            status_code=400,
-            detail="The cURL is missing the x-framework-xsrf-token header or "
-                   "the f.sid value. Copy a request that goes to a /rpc/ URL "
-                   "(e.g. open a mediation group first), not a static asset.")
-    row = db.query(AdMobSession).filter(AdMobSession.user_id == user.id).first()
-    if not row:
-        row = AdMobSession(user_id=user.id)
-        db.add(row)
-    row.encrypted_blob = encrypt_dict(parsed)
-    row.updated_at = datetime.utcnow()
-    db.commit()
-    return {"status": "ok", "cookie_len": len(parsed["cookie"]),
-            "saved_at": row.updated_at.strftime("%Y-%m-%d %H:%M")}
-
-
-@med_router.post("/builder/push-internal")
-def builder_push_internal(payload: dict = Body(...),
-                          db: Session = Depends(get_db),
-                          user: User = Depends(current_user)):
-    """Create real AdMob Network waterfall mediation groups via the internal
-    API, using the stored browser session."""
-    row = db.query(AdMobSession).filter(AdMobSession.user_id == user.id).first()
-    if not row or not row.encrypted_blob:
-        raise HTTPException(status_code=400,
-                            detail="No AdMob session saved. Paste your AdMob "
-                                   "cURL in the builder first.")
-    sess = decrypt_dict(row.encrypted_blob)
-    if not sess.get("cookie"):
-        raise HTTPException(status_code=400,
-                            detail="Saved AdMob session is empty/undecryptable "
-                                   "— paste a fresh cURL.")
-    app_row = db.query(AdMobApp).filter(
-        AdMobApp.id == int(payload.get("app_id") or 0),
-        AdMobApp.user_id == user.id).first()
-    if not app_row:
-        raise HTTPException(status_code=404, detail="App not found")
-    items = payload.get("items") or []
-    if not items:
-        raise HTTPException(status_code=400, detail="No ad units selected")
-    name_prefix = (payload.get("name_prefix") or "Group").strip().replace(" ", "_")
-    unique_names = bool(payload.get("unique_names"))
-
-    results: list[dict] = []
-    session_expired = False
-    _log(f"==== PUSH-INTERNAL START — {len(items)} ad unit(s) ====")
-    for item in items:
-        au_full = str(item.get("ad_unit_id") or "")
-        au_name = str(item.get("ad_unit_name") or au_full)
-        ad_format = str(item.get("ad_format") or "APP_OPEN")
-        ecpms = sorted([float(x) for x in (item.get("lines") or [])
-                        if float(x) > 0], reverse=True)
-        if not au_full or not ecpms:
-            continue
-        suffix = f"_{_random_suffix()}" if unique_names else ""
-        gname = f"{name_prefix}_{au_name}{suffix}".replace(" ", "_")[:80]
-        _log(f"  internal-create group={gname!r} target={au_full} "
-             f"tiers={len(ecpms)}")
-        try:
-            res = internal_create_waterfall_group(
-                sess, group_name=gname, platform=app_row.platform,
-                ad_format=ad_format, target_full_id=au_full, ecpms=ecpms,
-                include_bidding=True)
-        except AdMobInternalError as e:
-            session_expired = True
-            _log(f"  SESSION EXPIRED: {e}")
-            results.append({"ad_unit_id": au_full, "group": gname,
-                            "ok": False, "error": str(e), "log": []})
-            break
-        status = "PUSHED" if res.get("ok") else "PUSH_FAILED"
-        grp = MediationGroup(
-            user_id=user.id, name=gname, ad_format=ad_format,
-            platform=app_row.platform, status=status,
-            country_mode="GLOBAL", countries=[], floor_type=FLOOR_TYPES[0],
-            target_ad_unit_id=au_full, target_ad_unit_name=au_name,
-            base_avg_ecpm=ecpms[0], report_metrics=item.get("metrics") or {},
-            admob_group_id=res.get("group_id", "") if res.get("ok") else "",
-            last_push_response=json.dumps(res)[:4000])
-        db.add(grp); db.commit(); db.refresh(grp)
-        for i, ec in enumerate(ecpms, start=1):
-            db.add(WaterfallLine(
-                group_id=grp.id, priority=i - 1,
-                line_name=f"AdMob Network Waterfall {i} — ${ec:.2f}",
-                ecpm_usd=ec, enabled=bool(res.get("ok")),
-                network_code="ADMOB", cpm_mode="MANUAL"))
-        db.commit()
-        results.append({"ad_unit_id": au_full, "group": gname,
-                        "ok": bool(res.get("ok")),
-                        "error": res.get("error", ""),
-                        "group_id": res.get("group_id", ""),
-                        "lines": res.get("lines", 0),
-                        "log": res.get("log", []),
-                        "response": res.get("response", "")})
-    _log(f"==== PUSH-INTERNAL DONE — {sum(1 for r in results if r['ok'])}"
-         f"/{len(results)} ok ====")
-    return {"status": "ok", "results": results,
-            "session_expired": session_expired}
 
 
 @med_router.post("/builder/fetch-admob-groups")
@@ -3581,223 +4865,20 @@ def _build_waterfall_lines_from_credentials(
 # ============================================================================
 # Core builder: per source ad unit, create tier ad units + one mediation group
 # ============================================================================
-# ============================================================================
-# AdMob INTERNAL API (admob.google.com/v2/...) — creates real AdMob Network
-# waterfall lines. Auth = the user's browser session (cookie + xsrf token),
-# captured once from a DevTools cURL and stored encrypted. NOT the public API.
-# ============================================================================
-_ALLOC_RPC = ("https://admob.google.com/v2/mediationAllocation/_/rpc/"
-              "MediationAllocationService/V2Update")
-_GROUP_RPC = ("https://admob.google.com/v2/mediationGroup/_/rpc/"
-              "MediationGroupService/V2Update")
-
-# ad_format -> (targeting code, line format code, {platform: adapter}, verified)
-# Only APP_OPEN is confirmed from a real capture; others are best-guess.
-_INTERNAL_FMT = {
-    "APP_OPEN":              (7, 8, {"ANDROID": "616", "IOS": "617"}, True),
-    "BANNER":                (0, 1, {"ANDROID": "504", "IOS": "505"}, False),
-    "INTERSTITIAL":          (1, 1, {"ANDROID": "504", "IOS": "505"}, False),
-    "REWARDED":              (5, 1, {"ANDROID": "506", "IOS": "507"}, False),
-    "REWARDED_INTERSTITIAL": (6, 1, {"ANDROID": "510", "IOS": "511"}, False),
-    "NATIVE":                (2, 1, {"ANDROID": "508", "IOS": "509"}, False),
-}
-
-
-class AdMobInternalError(Exception):
-    """Raised when the internal-API session is invalid/expired."""
-
-
-def parse_admob_curl(curl_text: str) -> dict:
-    """Pull cookie, x-framework-xsrf-token and f.sid out of a DevTools
-    'Copy as cURL' blob (bash or cmd style)."""
-    import re
-    text = curl_text or ""
-    cookie = xsrf = f_sid = ""
-    m = re.search(r"(?:-b|--cookie)\s+(['\"])(.*?)\1", text, re.S)
-    if m:
-        cookie = m.group(2)
-    for hm in re.finditer(r"-H\s+(['\"])(.*?)\1", text, re.S):
-        h = hm.group(2)
-        low = h.lower()
-        if low.startswith("cookie:") and not cookie:
-            cookie = h.split(":", 1)[1].strip()
-        elif low.startswith("x-framework-xsrf-token:"):
-            xsrf = h.split(":", 1)[1].strip()
-    m = re.search(r"[?&]f\.sid=([^&'\"\s]+)", text)
-    if m:
-        f_sid = m.group(1)
-    return {"cookie": cookie.strip(), "xsrf": xsrf.strip(), "f_sid": f_sid.strip()}
-
-
-def _internal_post(sess: dict, url: str, activity: str, body_obj: dict) -> dict:
-    headers = {
-        "content-type": "application/x-www-form-urlencoded",
-        "cookie": sess.get("cookie", ""),
-        "x-framework-xsrf-token": sess.get("xsrf", ""),
-        "x-same-domain": "1",
-        "origin": "https://admob.google.com",
-        "referer": "https://admob.google.com/v2/mediation/groups/list",
-        "appname": "tlc",
-        "activityname": activity,
-        "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/146.0.0.0 Safari/537.36"),
-    }
-    body = "f.req=" + requests.utils.quote(
-        json.dumps(body_obj, separators=(",", ":")), safe="")
-    full = f"{url}?authuser=0&authuser=0&f.sid={sess.get('f_sid', '')}"
-    resp = requests.post(full, data=body, headers=headers, timeout=45)
-    return {"status": resp.status_code, "text": resp.text}
-
-
-def _strip_xssi(text: str) -> str:
-    t = (text or "").strip()
-    if t.startswith(")]}'"):
-        nl = t.find("\n")
-        t = t[nl + 1:] if nl != -1 else t[4:]
-    return t.strip()
-
-
-def _find_placement_id(parsed) -> str | None:
-    """Locate the created backing-placement id — an object carrying the
-    AdMob Network Waterfall source code "402" with a numeric id in field 1."""
-    hit: list[str] = []
-
-    def walk(o):
-        if hit:
-            return
-        if isinstance(o, dict):
-            v1 = o.get("1")
-            if o.get("3") == "402" and isinstance(v1, str) and v1.isdigit() \
-                    and v1 != "-1":
-                hit.append(v1)
-            for v in o.values():
-                walk(v)
-        elif isinstance(o, list):
-            for v in o:
-                walk(v)
-
-    walk(parsed)
-    return hit[0] if hit else None
-
-
-def _find_group_id(parsed) -> str:
-    def walk(o):
-        if isinstance(o, dict):
-            v = o.get("1")
-            if isinstance(v, str) and v.isdigit() and len(v) >= 6:
-                return v
-            for x in o.values():
-                g = walk(x)
-                if g:
-                    return g
-        elif isinstance(o, list):
-            for x in o:
-                g = walk(x)
-                if g:
-                    return g
-        return ""
-    return walk(parsed) or ""
-
-
-def internal_create_waterfall_group(sess: dict, *, group_name: str,
-                                     platform: str, ad_format: str,
-                                     target_full_id: str, ecpms: list,
-                                     include_bidding: bool = True) -> dict:
-    """Create ONE AdMob Network waterfall mediation group via the internal
-    API: a backing placement per eCPM tier, then the group with one
-    waterfall line per tier (+ AdMob Network bidding line). Raises
-    AdMobInternalError when the session is expired (HTTP 401/403)."""
-    fmt = _INTERNAL_FMT.get((ad_format or "").upper()) or _INTERNAL_FMT["APP_OPEN"]
-    target_code, line_fmt, adapters, _verified = fmt
-    plat_name = "IOS" if (platform or "").upper() == "IOS" else "ANDROID"
-    plat_code = 1 if plat_name == "IOS" else 2
-    adapter = adapters[plat_name]
-    short = str(target_full_id).split("/")[-1]
-    log: list[str] = []
-
-    # Diagnostic — list existing AdMob Network Waterfall (source 402)
-    # placements so the first run reveals the response shape + which
-    # backing ad units ("pubid") are available.
-    try:
-        lr = _internal_post(
-            sess, _ALLOC_RPC.replace("/V2Update", "/List"),
-            "MediationGroup.AdSourcePlacementSettingsInit", {"1": ["402"]})
-        log.append(f"List(402) HTTP {lr['status']}: {lr['text'][:700]}")
-    except Exception as e:
-        log.append(f"List(402) failed: {type(e).__name__}: {e}")
-
-    # PHASE 1 — one backing placement per eCPM tier.
-    placements: list[str] = []
-    for i, ecpm in enumerate(ecpms, start=1):
-        body = {"1": [{
-            "1": "-1", "2": True, "3": "402",
-            "4": [{"1": "pubid", "2": str(target_full_id)}],
-            "10": line_fmt, "12": short, "16": adapter,
-        }]}
-        r = _internal_post(sess, _ALLOC_RPC,
-                           "MediationGroup.CreateMappingInEditModal", body)
-        if r["status"] in (401, 403):
-            raise AdMobInternalError(f"session expired (HTTP {r['status']})")
-        if r["status"] != 200:
-            return {"ok": False, "log": log,
-                    "error": f"placement {i}: HTTP {r['status']} — "
-                             f"{r['text'][:600]}"}
-        pid = None
-        try:
-            pid = _find_placement_id(json.loads(_strip_xssi(r["text"])))
-        except Exception:
-            pass
-        if not pid:
-            return {"ok": False, "log": log,
-                    "error": f"placement {i}: id not found in response — "
-                             f"{r['text'][:600]}"}
-        log.append(f"placement {i} (${ecpm:.2f}) -> {pid}")
-        placements.append(pid)
-
-    # PHASE 2 — save the mediation group.
-    lines = []
-    if include_bidding:
-        lines.append({"2": "1", "3": 1, "4": 1,
-                      "5": {"1": "10000", "2": "USD"}, "6": False,
-                      "9": "AdMob Network", "11": 1, "14": "1"})
-    for ecpm, pid in zip(ecpms, placements):
-        micros = str(int(round(float(ecpm) * 1_000_000)))
-        lines.append({"2": "402", "3": line_fmt, "4": 2,
-                      "5": {"1": micros, "2": "USD"},
-                      "9": "AdMob Network Waterfall", "11": 1,
-                      "13": [pid], "14": adapter})
-    group = {"2": group_name, "3": 1,
-             "4": {"1": plat_code, "2": target_code, "3": [short]},
-             "5": lines, "10": {"1": 0}, "14": {}, "15": 0,
-             "16": {"1": False}, "17": False}
-    r = _internal_post(sess, _GROUP_RPC, "MediationGroup.Save", {"1": group})
-    if r["status"] in (401, 403):
-        raise AdMobInternalError(f"session expired (HTTP {r['status']})")
-    if r["status"] != 200:
-        return {"ok": False, "log": log,
-                "error": f"group save: HTTP {r['status']} — {r['text'][:800]}"}
-    gid = ""
-    try:
-        gid = _find_group_id(json.loads(_strip_xssi(r["text"])))
-    except Exception:
-        pass
-    return {"ok": True, "group_id": gid, "lines": len(lines),
-            "placements": placements, "log": log,
-            "response": r["text"][:1000]}
-
-
 def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool):
-    """For each selected source ad unit:
-      1. Push the user's saved /networks creds to AdMob as AdUnitMappings on
-         the source ad unit.
-      2. Create N tier ad units.
-      3. Replicate the source's 3P AdUnitMappings onto each tier.
-      4. Build bidding lines (AdMob Network LIVE + each replicated 3P source).
-      5. Create ONE mediation group (single API call) targeting source + all
-         tiers, with N MANUAL AdMob Network waterfall lines + the bidding
-         lines from step 4.
-      6. Read the group back and report what AdMob persisted.
+    """For each selected source ad unit, build a real AdMob mediation group
+    via the public v1alpha API:
+
+      1. batchCreate N AdMob Network Waterfall backing ad units (one per
+         tier eCPM). Each one comes back with an auto-created AdUnitMapping
+         on the source ad unit — that mapping is the "pubid" piece the
+         older internal-cURL hack used to fake.
+      2. Create ONE mediation group targeting the source ad unit, with:
+         - N MANUAL "AdMob Network Waterfall" lines (one per tier eCPM,
+           each referencing its auto-created mapping)
+         - 1 LIVE "AdMob Network" bidding line
+      3. Persist locally (MediationGroup + WaterfallLine rows mirror what
+         was actually pushed).
     """
     try:
         app_pk = int(payload.get("app_id") or 0)
@@ -3818,10 +4899,11 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
         raise HTTPException(status_code=400, detail="Bad floor_type")
     unique_names = bool(payload.get("unique_names"))
     name_prefix = (payload.get("name_prefix") or "Group").strip().replace(" ", "_")
-    # AdMob Network only: tier ad units + one group with MANUAL AdMob lines
-    # + AdMob Network LIVE bidding. The 3P bidding-replication path is
-    # disabled — ignore whatever the UI sends.
-    include_bidding = False
+    # Builder toggle: "Include All Bidding Networks" (default ON). When True,
+    # _generate_groups adds LIVE bidding lines from saved /bidding mappings.
+    include_bidding_networks = (
+        True if payload.get("include_bidding_networks") is None
+        else bool(payload.get("include_bidding_networks")))
     items = payload.get("items") or []
     if not items:
         raise HTTPException(status_code=400, detail="No ad units selected")
@@ -3846,7 +4928,12 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
         ad_unit_name = str(item.get("ad_unit_name") or ad_unit_id)
         ad_format = str(item.get("ad_format") or "BANNER")
         metrics = item.get("metrics") or {}
-        ecpms = [float(x) for x in (item.get("lines") or []) if float(x) > 0]
+        # Server-side clamp — even if the UI sends out-of-range tier eCPMs,
+        # AdMob rejects values outside [WATERFALL_MIN_ECPM, WATERFALL_MAX_ECPM].
+        ecpms = [
+            min(WATERFALL_MAX_ECPM, max(WATERFALL_MIN_ECPM, float(x)))
+            for x in (item.get("lines") or []) if float(x) > 0
+        ]
         if not ecpms:
             continue
         _log(f"---- [{item_idx}/{len(items)}] source ad_unit={ad_unit_id} "
@@ -3875,17 +4962,70 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
         waterfall_networks: list[str] = []
 
         if push_to_admob and client is not None:
-            # Waterfall MANUAL lines from saved 3rd-party network creds.
-            _log("Building waterfall lines from saved /networks credentials")
-            manual_lines, waterfall_networks = _build_waterfall_lines_from_credentials(
-                db=db, client=client, user=user, app_row=app_row,
-                source_ad_unit_id=ad_unit_id, ad_format=ad_format,
-                ecpms=ecpms, push_errors=push_errors,
-            )
-            _log(f"  built {len(manual_lines)} waterfall MANUAL line(s): "
-                 f"{', '.join(waterfall_networks) or 'none'}")
+            # Step 1 — batchCreate N AdMob Network Waterfall backing ad units
+            # (v1alpha). Each returned unit carries an auto-created
+            # AdUnitMapping on the source ad unit; that mapping is what the
+            # MANUAL waterfall line references.
+            sorted_ecpms = sorted([e for e in ecpms if e > 0], reverse=True)
+            tier_specs = [
+                (f"{ad_unit_name}_tier{i}_${ec:.2f}".replace(" ", "_")[:80], ec)
+                for i, ec in enumerate(sorted_ecpms, start=1)
+            ]
+            _log(f"  batchCreate {len(tier_specs)} AdMob Network Waterfall "
+                 f"backing ad unit(s) [v1alpha]")
+            try:
+                backing_units = _timed(
+                    "batch_create_waterfall_ad_units",
+                    lambda: client.batch_create_waterfall_ad_units(
+                        app_id=app_row.app_id,
+                        primary_ad_unit_id=ad_unit_id,
+                        ad_format=ad_format,
+                        tiers=tier_specs,
+                    ),
+                )
+            except AdMobAPIError as e:
+                _log(f"  batch_create_waterfall_ad_units FAILED: {e}")
+                push_errors.append({
+                    "ad_unit_id": ad_unit_id, "tier": "",
+                    "stage": "batch_create_waterfall_ad_units",
+                    "error": str(e),
+                })
+                backing_units = []
 
-            # AdMob Network LIVE bidding line — always present.
+            # Step 2 — build N MANUAL "AdMob Network Waterfall" lines, each
+            # referencing its tier's auto-created mapping.
+            try:
+                waterfall_source_id = client.get_admob_waterfall_source_id()
+            except AdMobAPIError:
+                # Hardcoded fallback — stable cross-account constant.
+                waterfall_source_id = "1215381445328257950"
+
+            manual_lines = []
+            waterfall_networks = []
+            for (tier_name, ec), bu in zip(tier_specs, backing_units):
+                mapping_name = (bu.get("mappingSetting", {}) or {}).get(
+                    "adUnitMappingId", "")
+                if not mapping_name:
+                    push_errors.append({
+                        "ad_unit_id": ad_unit_id, "tier": tier_name,
+                        "stage": "missing_auto_mapping",
+                        "error": "batchCreate returned no adUnitMappingId "
+                                 "for this tier — fall back to "
+                                 "accounts.adUnitMappings.batchCreate",
+                    })
+                    continue
+                manual_lines.append({
+                    "displayName": f"AdMob Waterfall ${ec:.2f}"[:255],
+                    "adSourceId": waterfall_source_id,
+                    "cpmMode": "MANUAL",
+                    "cpmMicros": str(int(round(ec * 1_000_000))),
+                    "state": "ENABLED",
+                    "adUnitMappings": {ad_unit_id: mapping_name},
+                })
+                waterfall_networks.append(f"Tier_${ec:.2f}")
+            _log(f"  built {len(manual_lines)} waterfall MANUAL line(s)")
+
+            # Step 3 — AdMob Network LIVE bidding line, always present.
             try:
                 admob_src_id = client.get_admob_network_source_id()
             except AdMobAPIError:
@@ -3897,10 +5037,92 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
                 "state": "ENABLED",
             }]
 
+            # Step 4 — 3P bidding LIVE lines from saved /bidding mappings
+            # (when the builder's "Include All Bidding Networks" toggle is
+            # on, default ON). For each enabled BiddingFormatMapping that
+            # matches (this app, this ad_format) AND whose saved
+            # `ad_unit_id` equals the source ad unit being pushed, create
+            # a real AdUnitMapping on the source + add a LIVE bidding line.
+            bidding_networks_added: list[str] = []
+            if include_bidding_networks:
+                fmt_key = (ad_format or "").upper()
+                # NOTE: NO ad_unit_id filter here — saved bidding configs
+                # apply to ANY source ad unit of the same (app, format).
+                # The mapping creation below uses the SOURCE ad unit being
+                # pushed (ad_unit_id), not the saved one. This matches the
+                # user's requirement: "bidding har ad pa aaye".
+                bidding_rows = db.query(BiddingFormatMapping).filter(
+                    BiddingFormatMapping.user_id == user.id,
+                    BiddingFormatMapping.app_id == app_row.id,
+                    BiddingFormatMapping.ad_format == fmt_key,
+                    BiddingFormatMapping.enabled == True,
+                ).all()
+                _log(f"  bidding: {len(bidding_rows)} enabled mapping(s) "
+                     f"for format={fmt_key} on this app")
+                for brow in bidding_rows:
+                    cat = NETWORK_BY_CODE.get(brow.network_code)
+                    if not cat:
+                        continue
+                    fields = (decrypt_dict(brow.encrypted_fields)
+                              if brow.encrypted_fields else {})
+                    if not any((v or "").strip() for v in fields.values()):
+                        _log(f"    {cat['name']}: no field values saved — "
+                             f"skipped")
+                        continue
+                    dn = (f"{cat['name']} bidding "
+                          f"{ad_unit_id.split('/')[-1][-6:]}")[:80]
+                    try:
+                        mp_resp, _warns = client.create_ad_unit_mapping_in_admob(
+                            ad_unit_id=ad_unit_id,
+                            network_code=brow.network_code,
+                            platform=app_row.platform,
+                            display_name=dn,
+                            user_fields=fields,
+                            ad_format=ad_format,
+                            for_bidding=True,
+                        )
+                    except AdMobAPIError as e:
+                        _log(f"    {cat['name']}: mapping create FAILED: {e}")
+                        push_errors.append({
+                            "ad_unit_id": ad_unit_id, "tier": "",
+                            "stage": (f"create_bidding_mapping("
+                                      f"{brow.network_code})"),
+                            "error": str(e),
+                        })
+                        continue
+                    mapping_name = (mp_resp or {}).get("name", "") or ""
+                    # CRITICAL: use the BIDDING source id (not waterfall) for
+                    # the LIVE bidding line. AdMob has a separate "(bidding)"
+                    # ad source per network — using the waterfall source for
+                    # LIVE lines triggers "CPM mode unsupported".
+                    src_id = client.find_bidding_source_id_for_network(
+                        brow.network_code)
+                    if not src_id:
+                        src_id = cat.get("admob_bidding_source_id") or cat.get("admob_source_id", "")
+                    if not mapping_name or not src_id:
+                        push_errors.append({
+                            "ad_unit_id": ad_unit_id, "tier": "",
+                            "stage": (f"create_bidding_mapping("
+                                      f"{brow.network_code})"),
+                            "error": ("mapping created but missing name or "
+                                      "source id"),
+                        })
+                        continue
+                    bidding_lines.append({
+                        "displayName": f"{cat['name']} (bidding)"[:255],
+                        "adSourceId": src_id,
+                        "cpmMode": "LIVE",
+                        "state": "ENABLED",
+                        "adUnitMappings": {ad_unit_id: mapping_name},
+                    })
+                    bidding_networks_added.append(cat["name"])
+                    _log(f"    + {cat['name']} LIVE bidding line ready")
+
             _log(f"Creating mediation group name={group_display_name!r} "
                  f"targeting {ad_unit_id} — "
                  f"{len(manual_lines)} waterfall line(s) + "
-                 f"1 AdMob Network bidding line")
+                 f"{len(bidding_lines)} bidding line(s) "
+                 f"(AdMob Network + {', '.join(bidding_networks_added) or 'no 3P'})")
             try:
                 mg_resp, manual_actual, live_actual, _m_req = _timed(
                     "create_mediation_group_in_admob",
@@ -3963,23 +5185,22 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
             last_push_response=(api_response_summary or group_error_log)[:4000],
         )
         db.add(group); db.commit(); db.refresh(group)
-        sorted_ecpms = sorted([e for e in ecpms if e and e > 0], reverse=True)
-        for i, ecpm in enumerate(sorted_ecpms, start=1):
-            net = (waterfall_networks[i - 1]
-                   if i - 1 < len(waterfall_networks) else "(needs network)")
+        sorted_ecpms_save = sorted([e for e in ecpms if e and e > 0], reverse=True)
+        line_pushed = bool(admob_group_id)
+        for i, ecpm in enumerate(sorted_ecpms_save, start=1):
             db.add(WaterfallLine(
                 group_id=group.id,
                 priority=i - 1,
-                line_name=f"Waterfall line {i} — {net} — ${ecpm:.2f}",
+                line_name=f"AdMob Network Waterfall {i} — ${ecpm:.2f}",
                 ecpm_usd=ecpm,
-                enabled=(i - 1 < len(waterfall_networks)),
-                network_code=net,
+                enabled=line_pushed,
+                network_code="ADMOB_WATERFALL",
                 cpm_mode="MANUAL",
             ))
         db.add(WaterfallLine(
             group_id=group.id, priority=99,
             line_name="AdMob Network (bidding)",
-            ecpm_usd=0.0, enabled=bool(admob_group_id),
+            ecpm_usd=0.0, enabled=line_pushed,
             network_code="ADMOB", cpm_mode="LIVE",
         ))
         db.commit()
@@ -4031,11 +5252,161 @@ def export_group(group_id: int, db: Session = Depends(get_db), user: User = Depe
     return JSONResponse(AdMobClient(db, user).export_group_config(group))
 
 
+# ============================================================================
+# CLEANUP ROUTES — bulk-delete ad units & disable mediation groups
+# ============================================================================
+cleanup_router = APIRouter(prefix="/cleanup", tags=["cleanup"])
+
+
+def _app_ad_unit_ids(db: Session, app_row: "AdMobApp") -> set[str]:
+    """Full ad unit ids ('ca-app-pub-X/Y') cached for an app."""
+    return {u.ad_unit_id for u in app_row.ad_units if u.ad_unit_id}
+
+
+def _groups_for_app(db: Session, user: User, app_row: "AdMobApp") -> list:
+    """Cached AdMob mediation groups that target any of this app's ad units.
+    Falls back to a platform match for groups whose targeting ad units AdMob
+    didn't return (rare)."""
+    app_units = _app_ad_unit_ids(db, app_row)
+    pub = _publisher_of_app_id(app_row.app_id)
+    rows = db.query(AdMobMediationGroupCache).filter(
+        AdMobMediationGroupCache.user_id == user.id,
+        AdMobMediationGroupCache.publisher_id == pub,
+    ).all()
+    out = []
+    for g in rows:
+        gids = set(g.ad_unit_ids or [])
+        if gids:
+            if gids & app_units:
+                out.append(g)
+        elif g.platform and g.platform == (app_row.platform or ""):
+            out.append(g)
+    return out
+
+
+@cleanup_router.get("", response_class=HTMLResponse)
+def cleanup_view(request: Request, db: Session = Depends(get_db),
+                 user: User = Depends(current_user)):
+    apps = (db.query(AdMobApp).filter(AdMobApp.user_id == user.id)
+            .order_by(AdMobApp.name).all())
+    return tmpl(request).TemplateResponse("cleanup.html", {
+        "request": request, "user": user, "apps": apps,
+    })
+
+
+@cleanup_router.get("/inventory/{app_db_id}")
+def cleanup_inventory(app_db_id: int, db: Session = Depends(get_db),
+                      user: User = Depends(current_user)):
+    """Return the cached ad units + mediation groups for an app — straight
+    from the DB, no AdMob call, so it's instant."""
+    app_row = db.query(AdMobApp).filter(
+        AdMobApp.id == app_db_id, AdMobApp.user_id == user.id).first()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="App not found")
+    ad_units = [
+        {"ad_unit_id": u.ad_unit_id, "name": u.name or "(unnamed)",
+         "ad_format": u.ad_format}
+        for u in sorted(app_row.ad_units, key=lambda x: (x.ad_format or "", x.name or ""))
+    ]
+    groups = [
+        {"group_id": g.group_id, "display_name": g.display_name or "(unnamed)",
+         "platform": g.platform, "ad_format": g.ad_format,
+         "state": g.state, "line_count": g.line_count}
+        for g in _groups_for_app(db, user, app_row)
+    ]
+    last_sync = app_row.last_synced_at.strftime("%Y-%m-%d %H:%M") if app_row.last_synced_at else ""
+    return {
+        "app": {"id": app_row.id, "name": app_row.name, "app_id": app_row.app_id,
+                "platform": app_row.platform, "last_synced_at": last_sync},
+        "ad_units": ad_units, "groups": groups,
+    }
+
+
+@cleanup_router.post("/delete")
+def cleanup_delete(payload: dict = Body(...), db: Session = Depends(get_db),
+                   user: User = Depends(current_user)):
+    """Delete selected ad units (hard delete) and disable selected mediation
+    groups (AdMob has no group hard-delete) for one app. Only ids that belong
+    to the app's cached inventory are accepted — a client can't pass arbitrary
+    ids. `dry_run` validates without mutating."""
+    app_db_id = payload.get("app_db_id")
+    req_unit_ids = [str(x) for x in (payload.get("ad_unit_ids") or [])]
+    req_group_ids = [str(x) for x in (payload.get("group_ids") or [])]
+    dry_run = bool(payload.get("dry_run"))
+    app_row = db.query(AdMobApp).filter(
+        AdMobApp.id == app_db_id, AdMobApp.user_id == user.id).first()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="App not found")
+    if not req_unit_ids and not req_group_ids:
+        raise HTTPException(status_code=400, detail="Nothing selected")
+
+    # Scope the request to ids that actually belong to this app's inventory.
+    valid_units = _app_ad_unit_ids(db, app_row)
+    unit_ids = [u for u in req_unit_ids if u in valid_units]
+    valid_groups = {g.group_id: g for g in _groups_for_app(db, user, app_row)}
+    group_ids = [gid for gid in req_group_ids if gid in valid_groups]
+
+    result = {
+        "dry_run": dry_run,
+        "ad_units": {"requested": len(req_unit_ids), "deleted": 0, "error": None},
+        "groups": {"requested": len(req_group_ids), "disabled": 0,
+                   "failed": [], "error": None},
+        "note": ("Mediation groups can't be hard-deleted via the AdMob API — "
+                 "they are DISABLED (stop serving; re-enableable). Ad units "
+                 "are permanently deleted."),
+    }
+    try:
+        client = AdMobClient(db, user)
+    except (AdMobAPIError, RuntimeError) as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # --- Ad units: hard delete via batchDelete ---
+    if unit_ids:
+        try:
+            res = client.batch_delete_ad_units(unit_ids, dry_run=dry_run)
+            result["ad_units"]["deleted"] = res.get("deleted", 0)
+            if not dry_run:
+                db.query(AdUnit).filter(
+                    AdUnit.app_id == app_row.id,
+                    AdUnit.ad_unit_id.in_(unit_ids),
+                ).delete(synchronize_session=False)
+                db.commit()
+        except AdMobAPIError as e:
+            result["ad_units"]["error"] = str(e)
+
+    # --- Mediation groups: disable via patch (no hard delete in API) ---
+    for gid in group_ids:
+        if dry_run:
+            result["groups"]["disabled"] += 1
+            continue
+        try:
+            client.disable_mediation_group(gid)
+            result["groups"]["disabled"] += 1
+            cache_row = valid_groups.get(gid)
+            if cache_row is not None:
+                cache_row.state = "DISABLED"
+            # Reflect the change on any locally-tracked copy of the group too.
+            db.query(MediationGroup).filter(
+                MediationGroup.user_id == user.id,
+                MediationGroup.admob_group_id == gid,
+            ).update({"status": "DISABLED"}, synchronize_session=False)
+        except AdMobAPIError as e:
+            result["groups"]["failed"].append({"group_id": gid, "error": str(e)})
+    if group_ids and not dry_run:
+        db.commit()
+
+    result["status"] = "ok" if not (
+        result["ad_units"]["error"] or result["groups"]["failed"]) else "partial"
+    return result
+
+
 app.include_router(auth_router)
 app.include_router(dash_router)
 app.include_router(apps_router)
 app.include_router(networks_router)
+app.include_router(bidding_router)
 app.include_router(med_router)
+app.include_router(cleanup_router)
 
 
 def _free_port_if_stuck(port: int) -> None:

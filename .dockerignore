@@ -1,0 +1,15 @@
+# Never ship secrets, local DB, logs, venv, or VCS into the image.
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+*.sqlite3
+flow.log
+.env
+.git/
+.gitignore
+.idea/
+.claude/
+*.md
+verify_write_access.py

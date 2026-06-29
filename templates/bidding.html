@@ -1,0 +1,357 @@
+{% extends "base.html" %}
+{% block title %}Bidding · Mediation Tool{% endblock %}
+{% block content %}
+<section class="page-head">
+  <p class="eyebrow">Bidding setup</p>
+  <h1 class="display">3rd-party bidding networks</h1>
+  <p class="lede">For each <b>app</b> + <b>network</b> + <b>ad format</b>, you fill the mapping <b>once</b> and pick which ad unit it applies to. Each (network, format) → one mapping. When the builder's "Include All Bidding Networks" is on AND the pushed source ad unit matches this mapping's ad unit, it becomes a LIVE bidding line on the mediation group.</p>
+</section>
+
+{% if not apps %}
+<div class="empty">
+  <p>No apps cached yet. <form method="post" action="/apps/sync" style="display:inline"><button class="btn-primary" type="submit">↻ Sync from AdMob</button></form></p>
+</div>
+{% else %}
+
+<div class="bid-wizard">
+  <!-- App selector -->
+  <div class="bid-app-pick">
+    <label class="bid-app-label">
+      <span class="lbl">Select App</span>
+      <select id="bid-app-select">
+        {% for a in apps %}<option value="{{ a.id }}">{{ a.name or a.app_id }} — {{ a.platform }} — {{ a.app_id }}</option>{% endfor %}
+      </select>
+    </label>
+  </div>
+
+  {% for a in apps %}
+  {% set summary = saved_summary.get(a.id, {"count":0, "enabled":0, "updated":""}) %}
+  <div class="bid-app-block" data-app="{{ a.id }}">
+
+    <!-- Saved-data status banner — auto-loaded from your local database -->
+    <div class="bid-loaded-banner {% if summary.count > 0 %}has-saved{% endif %}">
+      {% if summary.count > 0 %}
+        <span class="bid-loaded-pill">📦 {{ summary.count }} saved configuration{{ '' if summary.count==1 else 's' }} loaded</span>
+        <span class="muted small">{{ summary.enabled }} enabled · last updated {{ summary.updated }}</span>
+        <span class="bid-db-info muted small">Database: <code>{{ db_url.split('///')[-1] if '///' in db_url else db_url }}</code> · encrypted (AES-256-GCM)</span>
+      {% else %}
+        <span class="bid-loaded-pill bid-loaded-empty">No saved configurations yet — starting fresh</span>
+        <span class="bid-db-info muted small">Will save to <code>{{ db_url.split('///')[-1] if '///' in db_url else db_url }}</code></span>
+      {% endif %}
+    </div>
+
+    <!-- AUTO-CHECK: existing mediation groups for this app, per format -->
+    <section class="bid-existing-card">
+      <header class="bid-existing-head">
+        <h3>Existing Mediation Groups</h3>
+        <p class="muted small" style="margin:4px 0 0">Auto-fetched from your AdMob account for this app. "Mediation group not found" = nothing exists yet for that format, push will create new.</p>
+      </header>
+      <div class="bid-existing-grid" data-app="{{ a.id }}">
+        <div class="bid-existing-loading muted small">Loading from AdMob…</div>
+      </div>
+    </section>
+
+    <!-- STEP 1: Format Support Summary -->
+    <section class="bid-step-card">
+      <header class="bid-step-head">
+        <h3>Step 1: Format Support Summary</h3>
+        <p class="muted small">Select which ad sources you want to enable for each ad format. Tap a chip to toggle.</p>
+      </header>
+
+      {% for fmt in formats %}
+        {% set supporting = [] %}
+        {% for net in networks %}{% if fmt in (net.supports_formats or []) %}{% set _ = supporting.append(net) %}{% endif %}{% endfor %}
+        {% set selected = namespace(c=0) %}
+        {% for net in supporting %}
+          {% set m = mappings.get((a.id, net.code, fmt)) %}
+          {% if m and m.enabled %}{% set selected.c = selected.c + 1 %}{% endif %}
+        {% endfor %}
+        <div class="bid-fmt-summary">
+          <header>
+            <span class="bid-fmt-label">{{ fmt }}</span>
+            <span class="bid-count {% if selected.c > 0 %}is-on{% endif %}">{{ selected.c }} selected</span>
+          </header>
+          <div class="bid-chips">
+            {% if supporting %}
+              {% for net in supporting %}
+                {% set m = mappings.get((a.id, net.code, fmt), {"enabled": false}) %}
+                <a class="bid-chip {% if m.enabled %}is-on{% endif %}" data-target="bid-form-{{ a.id }}-{{ net.code }}-{{ fmt }}" href="#bid-form-{{ a.id }}-{{ net.code }}-{{ fmt }}">{{ net.name }}</a>
+              {% endfor %}
+            {% else %}
+              <span class="muted small">No ad networks available for this format</span>
+            {% endif %}
+          </div>
+        </div>
+      {% endfor %}
+    </section>
+
+    <!-- STEP 2: Configure Ad Units -->
+    <section class="bid-step-card">
+      <header class="bid-step-head">
+        <h3>Step 2: Configure Ad Units</h3>
+        <p class="muted small">Enter the required configuration values for selected ad sources. Each (network × format) is one mapping — pick the ad unit it applies to and fill the network's values.</p>
+      </header>
+
+      {% for fmt in formats %}
+        {% set supporting = [] %}
+        {% for net in networks %}{% if fmt in (net.supports_formats or []) %}{% set _ = supporting.append(net) %}{% endif %}{% endfor %}
+        {% if supporting %}
+          {% set fmt_units = units_by_app_format.get((a.id, fmt), []) %}
+          {% set has_enabled = namespace(b=false) %}
+          {% for net in supporting %}
+            {% set m = mappings.get((a.id, net.code, fmt)) %}
+            {% if m and m.enabled %}{% set has_enabled.b = true %}{% endif %}
+          {% endfor %}
+          <details class="bid-fmt-section" {% if has_enabled.b %}open{% endif %}>
+            <summary>
+              <span class="bid-fmt-label">{{ fmt }}</span>
+              <span class="bid-section-badge">{{ supporting|length }} networks</span>
+            </summary>
+            <div class="bid-fmt-section-body">
+              {% if not fmt_units %}
+                <p class="muted small" style="padding:6px 0">No <b>{{ fmt }}</b> ad units in this app. Sync /apps or create some in AdMob first.</p>
+              {% endif %}
+              {% for net in supporting %}
+                {% set m = mappings.get((a.id, net.code, fmt), {"enabled": false, "ad_unit_id": "", "fields": {}}) %}
+                <div id="bid-form-{{ a.id }}-{{ net.code }}-{{ fmt }}" class="bid-net-form {% if m.enabled %}is-on{% endif %}" data-network="{{ net.code }}" data-format="{{ fmt }}">
+                  <header class="bid-net-form-head">
+                    <label class="bid-net-toggle-wrap">
+                      <span class="bidding-toggle">
+                        <input type="checkbox" name="enabled" {% if m.enabled %}checked{% endif %} />
+                        <span class="bidding-slider"></span>
+                      </span>
+                      <span class="bid-net-name-big">{{ net.name }}</span>
+                    </label>
+                    <span class="muted small">Configuration</span>
+                  </header>
+                  <div class="bid-net-grid">
+                    {# Auto-pick the first ad unit of this format when no saved selection #}
+                    {% set default_au = fmt_units[0].ad_unit_id if fmt_units else '' %}
+                    {% set picked_au = m.ad_unit_id or default_au %}
+                    <label>
+                      <span class="lbl">Ad Unit ID <span class="muted small" style="font-weight:400">(auto-picked)</span></span>
+                      <select name="ad_unit_id">
+                        <option value="" {% if not picked_au %}selected{% endif %}>— None —</option>
+                        {% for u in fmt_units %}
+                          <option value="{{ u.ad_unit_id }}" {% if picked_au == u.ad_unit_id %}selected{% endif %}>{{ u.name }} ({{ u.ad_unit_id.split('/')[-1] }})</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    {% set total_fields = (net.app_fields or []) + (net.ad_unit_fields or []) %}
+                    {% for f in total_fields %}
+                      <label>
+                        <span class="lbl">{{ f.label }}</span>
+                        <input name="{{ f.key }}" type="{{ f.type }}" value="{{ m.fields.get(f.key, '') }}" placeholder="{{ f.help }}" />
+                      </label>
+                    {% endfor %}
+                  </div>
+                  {% if not total_fields %}
+                    <p class="muted small" style="margin:8px 0 0">{{ net.name }} needs no extra fields — AdMob handles its config internally.</p>
+                  {% endif %}
+                </div>
+              {% endfor %}
+            </div>
+          </details>
+        {% endif %}
+      {% endfor %}
+    </section>
+
+    <!-- JSON Preview -->
+    <section class="bid-step-card bid-preview-card">
+      <header class="bid-preview-head">
+        <div>
+          <h3>JSON Preview</h3>
+          <p class="muted small" style="margin:4px 0 0">Review the configuration before saving</p>
+        </div>
+        <button type="button" class="btn-secondary btn-sm bid-preview-toggle">Show Preview</button>
+      </header>
+      <pre class="bid-preview-json" style="display:none"></pre>
+    </section>
+
+    <!-- Confirm + Save All -->
+    <section class="bid-confirm-card">
+      <label class="bid-confirm">
+        <input type="checkbox" class="bid-confirm-cb" />
+        <span><strong>I confirm</strong> this configuration will be saved. Please review the configuration above before proceeding.</span>
+      </label>
+      <button type="button" class="btn-primary btn-lg bid-save-all" disabled>
+        💾  Save Bidding Configurations
+      </button>
+      <div class="bid-save-result muted small"></div>
+    </section>
+
+  </div>
+  {% endfor %}
+</div>
+
+<script>
+const appSel = document.getElementById('bid-app-select');
+const FORMATS = {{ formats|tojson }};
+const _checkedApps = new Set();
+
+function showApp() {
+  const id = appSel.value;
+  document.querySelectorAll('.bid-app-block').forEach(b => {
+    b.style.display = (b.dataset.app === id) ? '' : 'none';
+  });
+  // Lazy-fetch existing mediation groups for the newly visible app
+  if (id && !_checkedApps.has(id)) {
+    _checkedApps.add(id);
+    fetchExistingGroups(id);
+  }
+}
+appSel.addEventListener('change', showApp);
+showApp();
+
+async function fetchExistingGroups(appId) {
+  const grid = document.querySelector(`.bid-existing-grid[data-app="${appId}"]`);
+  if (!grid) return;
+  grid.innerHTML = '<div class="bid-existing-loading muted small">Loading from AdMob…</div>';
+  try {
+    const res = await fetch(`/bidding/${appId}/check-groups`);
+    if (!res.ok) {
+      const txt = await res.text();
+      grid.innerHTML = `<div class="muted small" style="color:var(--bad)">Could not fetch: ${txt.slice(0,200)}</div>`;
+      return;
+    }
+    const data = await res.json();
+    let html = '';
+    FORMATS.forEach(fmt => {
+      const groups = (data.by_format || {})[fmt] || [];
+      const hasGroups = groups.length > 0;
+      html += `
+        <div class="bid-existing-row ${hasGroups ? 'has-groups' : 'no-groups'}">
+          <div class="bid-existing-fmt">${fmt}</div>
+          <div class="bid-existing-status">
+            ${hasGroups
+              ? groups.map(g => `<span class="bid-existing-pill ${g.state === 'ENABLED' ? 'on' : 'off'}">${escapeHtml(g.name)} <span class="muted">· ${g.line_count} lines · ${g.state || '—'}</span></span>`).join('')
+              : `<span class="bid-not-found">Mediation group not found</span>`}
+          </div>
+        </div>`;
+    });
+    grid.innerHTML = html;
+  } catch (err) {
+    grid.innerHTML = `<div class="muted small" style="color:var(--bad)">Error: ${err.message}</div>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+// Step 1 chip → toggles the corresponding Step 2 form's enable checkbox + scrolls
+document.querySelectorAll('.bid-chip').forEach(chip => {
+  chip.addEventListener('click', (e) => {
+    e.preventDefault();
+    const target = document.getElementById(chip.dataset.target);
+    if (!target) return;
+    const cb = target.querySelector('input[name=enabled]');
+    if (cb) {
+      cb.checked = !cb.checked;
+      target.classList.toggle('is-on', cb.checked);
+      chip.classList.toggle('is-on', cb.checked);
+      // Update the format's "X selected" count
+      updateFormatCount(chip.closest('.bid-fmt-summary'));
+    }
+    const det = target.closest('details'); if (det) det.open = true;
+    target.scrollIntoView({behavior: 'smooth', block: 'center'});
+  });
+});
+
+function updateFormatCount(summary) {
+  if (!summary) return;
+  const chips = summary.querySelectorAll('.bid-chip');
+  const onCount = [...chips].filter(c => c.classList.contains('is-on')).length;
+  const badge = summary.querySelector('.bid-count');
+  if (badge) {
+    badge.textContent = `${onCount} selected`;
+    badge.classList.toggle('is-on', onCount > 0);
+  }
+}
+
+// Form toggle ↔ chip visual sync
+document.querySelectorAll('.bid-net-form input[name=enabled]').forEach(cb => {
+  cb.addEventListener('change', e => {
+    const form = e.target.closest('.bid-net-form');
+    form.classList.toggle('is-on', e.target.checked);
+    const chip = document.querySelector('.bid-chip[data-target="' + form.id + '"]');
+    if (chip) {
+      chip.classList.toggle('is-on', e.target.checked);
+      updateFormatCount(chip.closest('.bid-fmt-summary'));
+    }
+  });
+});
+
+// === Bulk collect → JSON Preview + Save All ===
+function currentAppId() { return appSel.value; }
+
+function collectMappings() {
+  const block = document.querySelector(`.bid-app-block[data-app="${currentAppId()}"]`);
+  if (!block) return [];
+  return [...block.querySelectorAll('.bid-net-form')].map(form => {
+    const fields = {};
+    form.querySelectorAll('.bid-net-grid input').forEach(inp => {
+      if (inp.name && inp.name !== 'enabled' && inp.name !== 'ad_unit_id') {
+        fields[inp.name] = inp.value || '';
+      }
+    });
+    return {
+      network: form.dataset.network,
+      format: form.dataset.format,
+      enabled: form.querySelector('input[name=enabled]')?.checked || false,
+      ad_unit_id: form.querySelector('select[name=ad_unit_id]')?.value || '',
+      fields,
+    };
+  });
+}
+
+// JSON Preview toggle (per app block — there are many, the visible one wins)
+document.querySelectorAll('.bid-preview-toggle').forEach(btn => {
+  btn.addEventListener('click', () => {
+    const pre = btn.closest('.bid-preview-card').querySelector('.bid-preview-json');
+    const open = pre.style.display !== 'none';
+    if (open) { pre.style.display = 'none'; btn.textContent = 'Show Preview'; }
+    else {
+      pre.style.display = '';
+      pre.textContent = JSON.stringify(collectMappings(), null, 2);
+      btn.textContent = 'Hide Preview';
+    }
+  });
+});
+
+// Confirm checkbox gates Save All
+document.querySelectorAll('.bid-confirm-cb').forEach(cb => {
+  cb.addEventListener('change', e => {
+    const card = e.target.closest('.bid-confirm-card');
+    card.querySelector('.bid-save-all').disabled = !e.target.checked;
+  });
+});
+
+// Save All — POST mappings to /bidding/{app}/save-all
+document.querySelectorAll('.bid-save-all').forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const out = btn.closest('.bid-confirm-card').querySelector('.bid-save-result');
+    const items = collectMappings();
+    if (!items.length) { out.textContent = 'No items to save.'; return; }
+    btn.disabled = true;
+    const orig = btn.textContent;
+    btn.textContent = 'Saving...';
+    try {
+      const res = await fetch(`/bidding/${currentAppId()}/save-all`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mappings: items}),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Save failed');
+      out.innerHTML = `<span style="color:var(--good)">✓ Saved ${data.saved} mapping(s) (${data.enabled} enabled) to database. They will auto-load next time.</span>`;
+    } catch (err) {
+      out.innerHTML = `<span style="color:var(--bad)">✗ ${err.message}</span>`;
+    } finally {
+      btn.textContent = orig;
+      btn.disabled = !btn.closest('.bid-confirm-card').querySelector('.bid-confirm-cb').checked;
+    }
+  });
+});
+</script>
+{% endif %}
+{% endblock %}
