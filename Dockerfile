@@ -16,6 +16,13 @@ COPY flow.py .
 COPY templates ./templates
 COPY static ./static
 
+# Persistent data directory for the SQLite database. Declaring it as a VOLUME
+# keeps the DB OUT of the container's writable layer, so it is not wiped when
+# the image is rebuilt. Mount a host dir or named volume here in production
+# (docker compose does this automatically — see docker-compose.yml).
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
 # Cloud Run sends traffic to $PORT (defaults to 8080). Bind 0.0.0.0 so the
 # container is reachable. Shell form so $PORT is expanded at runtime.
 ENV PORT=8080

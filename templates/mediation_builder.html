@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Mediation Builder · Mediation Tool{% endblock %}
+{% block title %}Mediation Builder · Flow{% endblock %}
 {% block content %}
 <section class="page-head">
   <p class="eyebrow">Builder</p>
@@ -81,6 +81,14 @@
       </div>
     </fieldset>
 
+    <div class="report-source" style="margin:4px 0 14px">
+      <span class="lbl" style="display:block;margin-bottom:6px">eCPM source</span>
+      <div class="radio-row">
+        <label><input type="radio" name="report_type" value="mediation" checked /> <span><b>Mediation</b> — Observed eCPM (matches AdMob UI · recommended)</span></label>
+        <label><input type="radio" name="report_type" value="network" /> <span><b>Network</b> — AdMob Network only</span></label>
+      </div>
+    </div>
+
     <div class="form-actions">
       <button class="btn-primary" id="fetch-report-btn" disabled>📊 Fetch AdMob Report (Last 7 Days)</button>
       <a href="/mediation" class="btn-ghost">Cancel</a>
@@ -95,6 +103,19 @@
     </div>
   </div>
 </div>
+
+<!-- Full-screen blocker shown while a push runs: progress bar + count + message.
+     position:fixed + high z-index so the user can't click anything else. -->
+<div id="push-overlay" style="display:none">
+  <div class="push-modal">
+    <h3 class="push-title">Creating mediation groups…</h3>
+    <div class="push-count"><span id="push-done">0</span> / <span id="push-total">0</span></div>
+    <div class="push-bar"><div class="push-bar-fill" id="push-bar-fill"></div></div>
+    <p class="push-msg" id="push-msg">Starting…</p>
+    <p class="push-note">Please keep this tab open — this can take a minute.</p>
+  </div>
+</div>
+<div id="snackbar"></div>
 
 <section id="report-section" style="display:none">
   <h2 class="section-title">Ad Unit Reports</h2>
@@ -161,8 +182,14 @@ const state = {
   unique_names: true,
   include_bidding_networks: true,
   name_prefix: "Global",
+  report_type: "mediation",
   report: null,
 };
+
+// eCPM source toggle (Mediation = matches AdMob UI / Network = AdMob Network only)
+$$('input[name="report_type"]').forEach(r => r.addEventListener("change", () => {
+  state.report_type = document.querySelector('input[name="report_type"]:checked').value;
+}));
 
 // Wire the "Include All Bidding Networks" toggle (default ON).
 const __incBidCb = document.getElementById("include-bidding");
@@ -238,7 +265,7 @@ function renderCountries() {
     chip.textContent = `${c.code} · ${c.name}`;
     chip.addEventListener("click", () => {
       if (on) state.countries.delete(c.code); else state.countries.add(c.code);
-      renderCountries(); updatePreview();
+      updateAutoPrefix(); renderCountries(); updatePreview();
     });
     wrap.appendChild(chip);
   });
@@ -318,18 +345,29 @@ $("#app-select").addEventListener("change", e => {
 $("#adunit-search").addEventListener("input", renderAdUnits);
 $("#adunit-all").addEventListener("click", () => { state.ad_units = [...(APP_AD_UNITS[state.app_id] || [])]; renderAdUnits(); updatePreview(); });
 $("#adunit-none").addEventListener("click", () => { state.ad_units = []; renderAdUnits(); updatePreview(); });
+// When countries are chosen, auto-fill the group name prefix (US, US_GB, ...)
+// so the user doesn't type it by hand. Manual edits afterwards still stick
+// until the country selection changes again.
+function updateAutoPrefix() {
+  let p;
+  if (state.country_mode === "GLOBAL" || state.countries.size === 0) p = "Global";
+  else p = [...state.countries].slice(0, 4).join("_") + (state.countries.size > 4 ? "_etc" : "");
+  const inp = $("#name-prefix");
+  if (inp) inp.value = p;
+  state.name_prefix = p;
+}
 $$('input[name="country_mode"]').forEach(r => r.addEventListener("change", () => {
   const mode = document.querySelector('input[name="country_mode"]:checked').value;
   state.country_mode = mode;
   $("#country-picker").style.display = mode === "GLOBAL" ? "none" : "";
   if (mode === "GLOBAL") state.countries.clear();
   if (mode !== "GLOBAL") renderCountries();
-  updatePreview();
+  updateAutoPrefix(); updatePreview();
 }));
 $("#country-search").addEventListener("input", renderCountries);
 $("#country-paste").addEventListener("change", e => {
   e.target.value.split(",").map(s => s.trim().toUpperCase()).filter(Boolean).forEach(c => state.countries.add(c));
-  renderCountries(); updatePreview();
+  updateAutoPrefix(); renderCountries(); updatePreview();
 });
 $("#line-count").addEventListener("change", e => { state.line_count = Math.max(1, Math.min(MAX_LINES, +e.target.value || DEFAULT_LINES)); updatePreview(); if (state.report) renderReport(); });
 $("#name-prefix").addEventListener("input", e => { state.name_prefix = e.target.value || "Group"; updatePreview(); });
@@ -345,6 +383,7 @@ $("#fetch-report-btn").addEventListener("click", async () => {
         ad_unit_ids,
         country_mode: state.country_mode,
         countries: [...state.countries],
+        report_type: state.report_type,
       }),
     });
     const data = await res.json();
@@ -352,7 +391,9 @@ $("#fetch-report-btn").addEventListener("click", async () => {
     state.report = data.report || {};
     const geo = (data.countries && data.countries.length)
       ? `Geo: ${data.countries.join(", ")}` : "Geo: Global (all countries)";
-    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo}`;
+    const src = (data.report_type === "network")
+      ? "Source: Network (AdMob Network)" : "Source: Mediation (Observed eCPM)";
+    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo} · ${src}`;
     renderReport();
     $("#report-section").style.display = "";
     $("#report-section").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -422,6 +463,53 @@ function renderReport() {
   });
 }
 
+function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function showSnackbar(text) {
+  const sb = document.getElementById("snackbar");
+  if (!sb) return;
+  sb.textContent = text; sb.classList.add("show");
+  clearTimeout(sb._t); sb._t = setTimeout(() => sb.classList.remove("show"), 4000);
+}
+function showPushOverlay(on) {
+  const o = document.getElementById("push-overlay");
+  if (o) o.style.display = on ? "flex" : "none";
+}
+function updatePushProgress(done, total, msg) {
+  done = done || 0; total = total || 0;
+  const pct = total ? Math.round(done / total * 100) : 0;
+  const f = document.getElementById("push-bar-fill"); if (f) f.style.width = pct + "%";
+  const d = document.getElementById("push-done"); if (d) d.textContent = done;
+  const t = document.getElementById("push-total"); if (t) t.textContent = total;
+  const m = document.getElementById("push-msg"); if (m && msg) m.textContent = msg;
+}
+
+// Poll a background push job. Each request is short, so the ~100s proxy limit
+// never triggers no matter how long the actual AdMob push takes. Each poll
+// updates the progress bar + count + snackbar.
+async function pollPushJob(jobId) {
+  let lastDone = -1;
+  for (let i = 0; i < 300; i++) {            // ~12 min ceiling at 2.5s each
+    await _sleep(2500);
+    let r;
+    try { r = await fetch(`/mediation/builder/push-status/${jobId}`); }
+    catch (_) { continue; }                  // transient blip — keep polling
+    if (r.status === 404)
+      throw new Error("Push job not found — open the Mediation page to see if the groups were created.");
+    let j; try { j = JSON.parse(await r.text()); } catch (_) { continue; }
+    if (j.status === "running") {
+      updatePushProgress(j.done, j.total, j.message);
+      if (typeof j.done === "number" && j.done !== lastDone && j.total) {
+        lastDone = j.done;
+        showSnackbar(`${j.done}/${j.total} ad unit(s) created in the background…`);
+      }
+    }
+    if (j.status === "done") { updatePushProgress(j.total, j.total, "Done ✓"); return j.result; }
+    if (j.status === "error") throw new Error(j.error || "Push failed");
+  }
+  throw new Error("Push is taking unusually long. Open the Mediation page to check the created groups.");
+}
+
 async function submitGroups(endpoint, label) {
     const btn = document.getElementById(label === "push" ? "push-btn" : "generate-btn");
     const items = state.ad_units.map(u => {
@@ -464,8 +552,35 @@ async function submitGroups(endpoint, label) {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify(body),
       });
-      const data = await res.json();
+      // The push can be long (many AdMob calls). If it exceeds the proxy's
+      // ~100s limit, the server/proxy returns an HTML error page, not JSON —
+      // parse defensively so we show a clear message instead of a cryptic
+      // "Unexpected token '<'".
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch (_) {
+        throw new Error(
+          "The request took too long and the connection timed out.\n\n" +
+          "IMPORTANT: your group(s) may STILL have been created on AdMob — " +
+          "open the Mediation page to check BEFORE retrying (so you don't make duplicates).");
+      }
       if (!res.ok) throw new Error(data.detail || "Request failed");
+
+      // Push runs as a background job — poll until it finishes, with a
+      // blocking overlay + progress bar + snackbar so the user can't touch
+      // anything mid-run. (Save/draft returns directly, no job_id to poll.)
+      if (data.job_id) {
+        btn.textContent = "Working…";
+        showPushOverlay(true);
+        updatePushProgress(0, items.length, "Starting…");
+        showSnackbar(`Creating ${items.length} mediation group(s) in the background…`);
+        try {
+          data = await pollPushJob(data.job_id);
+        } finally {
+          showPushOverlay(false);
+        }
+      }
 
       let msg;
       if (label === "push") {
@@ -617,8 +732,7 @@ document.getElementById("push-existing-btn").addEventListener("click", async () 
       const msg = data.status === "ok"
         ? `✓ Patched ${data.lines_pushed} of ${data.lines_requested} lines.`
         : `⚠ Partial: patched ${data.lines_pushed} of ${data.lines_requested} lines.`;
-      alert(msg);
-      window.location = "/mediation";
+      alert(msg + "\n\nYou're still on the Builder. Open /mediation to view all groups.");
     }
   } catch (err) {
     alert("Error: " + err.message);

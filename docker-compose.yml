@@ -1,0 +1,20 @@
+# Foolproof deployment: the ./data bind-mount is ALWAYS applied, so the SQLite
+# database (./data/admob_tool.db on the host) survives every rebuild/redeploy.
+# You cannot "forget the -v flag" — it's encoded here.
+#
+#   Deploy / update:   docker compose up -d --build
+#   Logs:              docker compose logs -f
+#   Stop:              docker compose down        (data in ./data is kept)
+#
+# Make sure .env has:  database_url=sqlite:////app/data/admob_tool.db
+services:
+  flow:
+    build: .
+    image: flow
+    container_name: flow
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file: .env
+    volumes:
+      - ./data:/app/data        # host ./data  <->  container /app/data (the DB)

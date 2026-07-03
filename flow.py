@@ -1,5 +1,5 @@
 """
-AdMob Mediation Tool — single-file FastAPI app.
+Flow — single-file FastAPI app.
 
 Per push, for each selected source ad unit:
   1) Push the user's saved /networks credentials to AdMob as AdUnitMappings
@@ -35,7 +35,9 @@ import json
 import random
 import string
 import sys
+import threading
 import time
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -214,6 +216,58 @@ COMMON_COUNTRIES = [
     {"code": "CH", "name": "Switzerland"}, {"code": "AT", "name": "Austria"},
     {"code": "BE", "name": "Belgium"}, {"code": "DK", "name": "Denmark"},
     {"code": "FI", "name": "Finland"}, {"code": "PT", "name": "Portugal"},
+    # --- Middle East ---
+    {"code": "KW", "name": "Kuwait"}, {"code": "QA", "name": "Qatar"},
+    {"code": "OM", "name": "Oman"}, {"code": "BH", "name": "Bahrain"},
+    {"code": "JO", "name": "Jordan"}, {"code": "LB", "name": "Lebanon"},
+    {"code": "YE", "name": "Yemen"}, {"code": "SY", "name": "Syria"},
+    {"code": "PS", "name": "Palestine"}, {"code": "IL", "name": "Israel"},
+    # --- North Africa & Africa ---
+    {"code": "MA", "name": "Morocco"}, {"code": "DZ", "name": "Algeria"},
+    {"code": "TN", "name": "Tunisia"}, {"code": "LY", "name": "Libya"},
+    {"code": "SD", "name": "Sudan"}, {"code": "TZ", "name": "Tanzania"},
+    {"code": "GH", "name": "Ghana"}, {"code": "UG", "name": "Uganda"},
+    {"code": "ET", "name": "Ethiopia"}, {"code": "CI", "name": "Côte d'Ivoire"},
+    {"code": "SN", "name": "Senegal"}, {"code": "CM", "name": "Cameroon"},
+    {"code": "ZM", "name": "Zambia"}, {"code": "ZW", "name": "Zimbabwe"},
+    {"code": "AO", "name": "Angola"}, {"code": "MZ", "name": "Mozambique"},
+    {"code": "RW", "name": "Rwanda"}, {"code": "ML", "name": "Mali"},
+    {"code": "MG", "name": "Madagascar"}, {"code": "BF", "name": "Burkina Faso"},
+    {"code": "BJ", "name": "Benin"}, {"code": "BW", "name": "Botswana"},
+    {"code": "MU", "name": "Mauritius"},
+    # --- Central / South / Southeast Asia ---
+    {"code": "AZ", "name": "Azerbaijan"}, {"code": "KZ", "name": "Kazakhstan"},
+    {"code": "UZ", "name": "Uzbekistan"}, {"code": "GE", "name": "Georgia"},
+    {"code": "AM", "name": "Armenia"}, {"code": "KG", "name": "Kyrgyzstan"},
+    {"code": "TJ", "name": "Tajikistan"}, {"code": "TM", "name": "Turkmenistan"},
+    {"code": "AF", "name": "Afghanistan"}, {"code": "MM", "name": "Myanmar (Burma)"},
+    {"code": "KH", "name": "Cambodia"}, {"code": "LA", "name": "Laos"},
+    {"code": "NP", "name": "Nepal"}, {"code": "LK", "name": "Sri Lanka"},
+    {"code": "MN", "name": "Mongolia"}, {"code": "BN", "name": "Brunei"},
+    {"code": "BT", "name": "Bhutan"}, {"code": "MV", "name": "Maldives"},
+    # --- Europe ---
+    {"code": "CZ", "name": "Czechia"}, {"code": "GR", "name": "Greece"},
+    {"code": "HU", "name": "Hungary"}, {"code": "RO", "name": "Romania"},
+    {"code": "BG", "name": "Bulgaria"}, {"code": "HR", "name": "Croatia"},
+    {"code": "RS", "name": "Serbia"}, {"code": "SK", "name": "Slovakia"},
+    {"code": "SI", "name": "Slovenia"}, {"code": "LT", "name": "Lithuania"},
+    {"code": "LV", "name": "Latvia"}, {"code": "EE", "name": "Estonia"},
+    {"code": "UA", "name": "Ukraine"}, {"code": "BY", "name": "Belarus"},
+    {"code": "IS", "name": "Iceland"}, {"code": "LU", "name": "Luxembourg"},
+    {"code": "CY", "name": "Cyprus"}, {"code": "MT", "name": "Malta"},
+    {"code": "AL", "name": "Albania"}, {"code": "MK", "name": "North Macedonia"},
+    {"code": "BA", "name": "Bosnia & Herzegovina"}, {"code": "MD", "name": "Moldova"},
+    # --- Latin America & Caribbean ---
+    {"code": "EC", "name": "Ecuador"}, {"code": "VE", "name": "Venezuela"},
+    {"code": "BO", "name": "Bolivia"}, {"code": "PY", "name": "Paraguay"},
+    {"code": "UY", "name": "Uruguay"}, {"code": "GT", "name": "Guatemala"},
+    {"code": "CR", "name": "Costa Rica"}, {"code": "PA", "name": "Panama"},
+    {"code": "DO", "name": "Dominican Republic"}, {"code": "HN", "name": "Honduras"},
+    {"code": "SV", "name": "El Salvador"}, {"code": "NI", "name": "Nicaragua"},
+    {"code": "PR", "name": "Puerto Rico"}, {"code": "JM", "name": "Jamaica"},
+    {"code": "TT", "name": "Trinidad & Tobago"},
+    # --- Oceania ---
+    {"code": "FJ", "name": "Fiji"}, {"code": "PG", "name": "Papua New Guinea"},
 ]
 FLOOR_TYPES = ["ALL_PRICES", "PREMIUM_ONLY", "CUSTOM"]
 
@@ -452,8 +506,30 @@ def decrypt_dict(token: str) -> dict:
 # ============================================================================
 # DATABASE
 # ============================================================================
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
-engine = create_engine(settings.database_url, connect_args=connect_args, echo=False)
+_is_sqlite = settings.database_url.startswith("sqlite")
+connect_args = {"check_same_thread": False} if _is_sqlite else {}
+_engine_kwargs = {"connect_args": connect_args, "echo": False}
+if not _is_sqlite:
+    # For a remote Postgres/MySQL backend: test each pooled connection before
+    # use and recycle stale ones, so a dropped idle connection doesn't fail the
+    # next query. Completely inert for the default local SQLite database.
+    _engine_kwargs["pool_pre_ping"] = True
+    _engine_kwargs["pool_recycle"] = 300
+else:
+    # Make SQLite persistence robust: if the DB lives in a sub-directory (e.g.
+    # the mounted volume at /app/data when deployed), create that directory so
+    # the engine can always open/create the file there — a missing dir would
+    # otherwise crash on first query and look like "the database disappeared".
+    try:
+        from sqlalchemy.engine import make_url
+        _db_file = make_url(settings.database_url).database
+        if _db_file and _db_file != ":memory:":
+            _db_dir = os.path.dirname(os.path.abspath(_db_file))
+            if _db_dir:
+                os.makedirs(_db_dir, exist_ok=True)
+    except Exception as _e:
+        _log(f"  warning: could not pre-create SQLite dir ({_e})")
+engine = create_engine(settings.database_url, **_engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -908,9 +984,18 @@ class AdMobClient:
 
     def fetch_network_report_for_ad_units(self, ad_unit_ids: list[str],
                                           start: str, end: str,
-                                          countries: list[str] | None = None) -> dict[str, dict]:
+                                          countries: list[str] | None = None,
+                                          report_type: str = "mediation") -> dict[str, dict]:
+        # report_type:
+        #   "mediation" (default) -> Mediation report, eCPM = OBSERVED_ECPM.
+        #       Matches the value shown in the AdMob UI (whole waterfall, all
+        #       ad sources). Best for seeing real per-ad-unit performance.
+        #   "network" -> Network report, eCPM = AdMob Network earnings/impr.
+        #       Only the AdMob Network ad source. Useful when building the
+        #       AdMob Network waterfall tiers specifically.
         if not ad_unit_ids:
             return {}
+        use_mediation = (report_type or "mediation").lower() != "network"
         parent = f"accounts/{self.get_publisher_id()}"
         dimension_filters = [
             {"dimension": "AD_UNIT", "matchesAny": {"values": ad_unit_ids}}
@@ -925,20 +1010,28 @@ class AdMobClient:
             dimension_filters.append(
                 {"dimension": "COUNTRY", "matchesAny": {"values": cc}}
             )
+        if use_mediation:
+            # Mediation report -> OBSERVED_ECPM matches the AdMob UI exactly.
+            metrics = ["AD_REQUESTS", "MATCHED_REQUESTS", "IMPRESSIONS",
+                       "ESTIMATED_EARNINGS", "CLICKS", "IMPRESSION_CTR",
+                       "MATCH_RATE", "OBSERVED_ECPM"]
+        else:
+            # Network report -> AdMob Network only; eCPM derived from earnings.
+            metrics = ["AD_REQUESTS", "MATCHED_REQUESTS", "IMPRESSIONS",
+                       "ESTIMATED_EARNINGS", "CLICKS", "IMPRESSION_CTR",
+                       "IMPRESSION_RPM", "MATCH_RATE", "SHOW_RATE"]
         body = {
             "reportSpec": {
                 "dateRange": {"startDate": _date_parts(start), "endDate": _date_parts(end)},
                 "dimensions": ["AD_UNIT"],
                 "dimensionFilters": dimension_filters,
-                "metrics": [
-                    "AD_REQUESTS", "MATCHED_REQUESTS", "IMPRESSIONS",
-                    "ESTIMATED_EARNINGS", "CLICKS", "IMPRESSION_CTR",
-                    "IMPRESSION_RPM", "MATCH_RATE", "SHOW_RATE",
-                ],
+                "metrics": metrics,
             }
         }
+        report_res = (self.service.accounts().mediationReport()
+                      if use_mediation else self.service.accounts().networkReport())
         resp = self._with_quota_retry(
-            lambda: self.service.accounts().networkReport().generate(parent=parent, body=body).execute()
+            lambda: report_res.generate(parent=parent, body=body).execute()
         )
 
         rows = resp if isinstance(resp, list) else []
@@ -979,11 +1072,15 @@ class AdMobClient:
             impressions = _int("IMPRESSIONS")
             clicks = _int("CLICKS")
             earnings_micros = _micros("ESTIMATED_EARNINGS")
-            rpm_micros = _micros("IMPRESSION_RPM")
-
             revenue_usd = earnings_micros / 1_000_000.0
-            rpm_usd = rpm_micros / 1_000_000.0
-            ecpm_usd = (revenue_usd / impressions * 1000.0) if impressions else 0.0
+            if use_mediation:
+                # eCPM straight from AdMob's OBSERVED_ECPM (matches the UI).
+                ecpm_usd = _micros("OBSERVED_ECPM") / 1_000_000.0
+                rpm_usd = (revenue_usd / impressions * 1000.0) if impressions else 0.0
+            else:
+                # Network report: derive eCPM from earnings / impressions.
+                rpm_usd = _micros("IMPRESSION_RPM") / 1_000_000.0
+                ecpm_usd = (revenue_usd / impressions * 1000.0) if impressions else 0.0
 
             match_rate = (matched / ad_requests) if ad_requests else 0.0
             show_rate = (impressions / matched) if matched else 0.0
@@ -1481,52 +1578,60 @@ class AdMobClient:
             # AdMob Network LIVE line will be the only bidding line (auto-added).
             return out, errors, network_titles
 
-        # 4. For each tier ad unit, create one mapping per template
+        # 4. Create ALL tier mappings in ONE batched call (chunked) instead of
+        #    one API call + a 1-second sleep per (tier x network). The old loop
+        #    cost ~1s per mapping — minutes for many tiers/networks/ad units.
+        #    adUnitMappings.batchCreate does the whole set in a single request,
+        #    so the push is dramatically faster and uses far less write quota.
         pub_id = self.get_publisher_id()
+        short_to_tier: dict[str, str] = {}   # ad-unit short id -> full tier id
+        batch_requests: list[dict] = []
         for tier_id in tier_ad_unit_ids:
             if not tier_id:
                 continue
             short = tier_id.split("/")[-1] if "/" in tier_id else tier_id
+            short_to_tier[short] = tier_id
             parent = f"accounts/{pub_id}/adUnits/{short}"
             for src_id, tmpl in templates.items():
-                # Throttle to avoid hammering AdMob's write quota; the
-                # retry helper handles real saturation when it happens.
-                time.sleep(1.0)
-                # NOTE: `name` on AdUnitMapping is OUTPUT-ONLY (the server
-                # assigns the resource path). User-supplied labels go in
-                # `displayName`. Sending `name` here was silently ignored.
-                body = {
-                    "displayName": (f"tier_{src_id[:8]}_{short[-6:]}_"
-                                    f"{_random_suffix(4)}")[:80],
-                    "adapterId": tmpl["adapter_id"],
-                    "adUnitConfigurations": tmpl["configs"],
-                    "state": "ENABLED",
-                }
-                try:
-                    resp = self._with_quota_retry(
-                        lambda b=body, p=parent: self.service_alpha.accounts()
-                        .adUnits().adUnitMappings().create(
-                            parent=p, body=b,
-                        ).execute()
-                    )
-                    mapping_name = resp.get("name", "") or ""
-                    if mapping_name:
-                        out[tier_id][src_id] = mapping_name
-                    else:
-                        errors.append({
-                            "tier_ad_unit_id": tier_id,
-                            "ad_source_id": src_id,
-                            "stage": "create_tier_mapping",
-                            "error": (f"{tmpl['title']}: create returned "
-                                      "no resource name"),
-                        })
-                except AdMobAPIError as e:
-                    errors.append({
-                        "tier_ad_unit_id": tier_id,
-                        "ad_source_id": src_id,
-                        "stage": "create_tier_mapping",
-                        "error": f"{tmpl['title']}: {e}",
-                    })
+                # `name` is output-only; labels go in `displayName`.
+                batch_requests.append({
+                    "parent": parent,
+                    "adUnitMapping": {
+                        "displayName": (f"tier_{src_id[:8]}_{short[-6:]}_"
+                                        f"{_random_suffix(4)}")[:80],
+                        "adapterId": tmpl["adapter_id"],
+                        "adUnitConfigurations": tmpl["configs"],
+                        "state": "ENABLED",
+                    },
+                })
+
+        CHUNK = 50
+        for i in range(0, len(batch_requests), CHUNK):
+            chunk = batch_requests[i:i + CHUNK]
+            try:
+                resp = self._with_quota_retry(
+                    lambda c=chunk: self.service_alpha.accounts()
+                    .adUnitMappings().batchCreate(
+                        parent=f"accounts/{pub_id}",
+                        body={"requests": c},
+                    ).execute()
+                )
+            except AdMobAPIError as e:
+                errors.append({"tier_ad_unit_id": "", "ad_source_id": "",
+                               "stage": "batch_create_tier_mappings",
+                               "error": str(e)})
+                continue
+            # Map every created mapping back to (tier_id, src_id) via its
+            # resource name (.../adUnits/<short>/...) and adapterId.
+            for mp in resp.get("adUnitMappings", []) or []:
+                name = mp.get("name", "") or ""
+                src_id = adapter_to_source.get(str(mp.get("adapterId", "")), "")
+                short = ""
+                if "/adUnits/" in name:
+                    short = name.split("/adUnits/", 1)[1].split("/", 1)[0]
+                tier_id = short_to_tier.get(short, "")
+                if tier_id and src_id and name:
+                    out[tier_id][src_id] = name
 
         # De-dupe network titles
         network_titles = list(dict.fromkeys(network_titles))
@@ -2020,7 +2125,7 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{% block title %}AdMob Mediation Tool{% endblock %}</title>
+  <title>{% block title %}Flow{% endblock %}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -2028,7 +2133,7 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><a href="/" class="brand-link"><span class="brand-mark">⌬</span><span class="brand-name">Mediation<span class="brand-dot">.</span>Tool</span></a></div>
+    <div class="brand"><a href="/" class="brand-link"><span class="brand-mark">⌬</span><span class="brand-name">Flow</span></a></div>
     <nav class="topnav">
       {% if user and user.id %}
         <a href="/dashboard">Dashboard</a>
@@ -2045,12 +2150,12 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
     </nav>
   </header>
   <main class="content">{% block content %}{% endblock %}</main>
-  <footer class="footer"><span>AdMob Mediation Tool</span><span class="footer-sep">·</span><span>1 group per source · Tier ad units · Replicated bidding mappings · Live audit</span></footer>
+  <footer class="footer"><span>Flow</span><span class="footer-sep">·</span><span>1 group per source · Tier ad units · Replicated bidding mappings · Live audit</span></footer>
 </body>
 </html>"""
 
 TEMPLATE_FILES["login.html"] = r"""{% extends "base.html" %}
-{% block title %}Sign in · Mediation Tool{% endblock %}
+{% block title %}Sign in · Flow{% endblock %}
 {% block content %}
 <section class="login-wrap">
   <div class="login-card">
@@ -2076,7 +2181,7 @@ TEMPLATE_FILES["login.html"] = r"""{% extends "base.html" %}
 {% endblock %}"""
 
 TEMPLATE_FILES["dashboard.html"] = r"""{% extends "base.html" %}
-{% block title %}Dashboard · Mediation Tool{% endblock %}
+{% block title %}Dashboard · Flow{% endblock %}
 {% block content %}
 <section class="page-head"><p class="eyebrow">Dashboard</p><h1 class="display">Welcome, {{ user.name or user.email }}.</h1></section>
 {% if api_error %}<div class="alert alert-warn"><strong>AdMob API:</strong> {{ api_error }}</div>{% endif %}
@@ -2153,7 +2258,7 @@ TEMPLATE_FILES["dashboard.html"] = r"""{% extends "base.html" %}
 {% endblock %}"""
 
 TEMPLATE_FILES["cleanup.html"] = r"""{% extends "base.html" %}
-{% block title %}Cleanup · Mediation Tool{% endblock %}
+{% block title %}Cleanup · Flow{% endblock %}
 {% block content %}
 <section class="page-head">
   <p class="eyebrow">Cleanup</p>
@@ -2302,7 +2407,7 @@ TEMPLATE_FILES["cleanup.html"] = r"""{% extends "base.html" %}
 {% endblock %}"""
 
 TEMPLATE_FILES["apps.html"] = r"""{% extends "base.html" %}
-{% block title %}Apps · Mediation Tool{% endblock %}
+{% block title %}Apps · Flow{% endblock %}
 {% block content %}
 <section class="page-head row-between">
   <div><p class="eyebrow">Apps</p><h1 class="display">Your AdMob apps</h1></div>
@@ -2328,7 +2433,7 @@ TEMPLATE_FILES["apps.html"] = r"""{% extends "base.html" %}
 {% endblock %}"""
 
 TEMPLATE_FILES["app_detail.html"] = r"""{% extends "base.html" %}
-{% block title %}{{ app.name }} · Mediation Tool{% endblock %}
+{% block title %}{{ app.name }} · Flow{% endblock %}
 {% block content %}
 <section class="page-head">
   <p class="eyebrow"><a href="/apps">← Apps</a></p>
@@ -2347,7 +2452,7 @@ TEMPLATE_FILES["app_detail.html"] = r"""{% extends "base.html" %}
 {% endblock %}"""
 
 TEMPLATE_FILES["mediation_list.html"] = r"""{% extends "base.html" %}
-{% block title %}Mediation groups · Mediation Tool{% endblock %}
+{% block title %}Mediation groups · Flow{% endblock %}
 {% block content %}
 <section class="page-head row-between">
   <div><p class="eyebrow">Mediation</p><h1 class="display">Your mediation groups</h1></div>
@@ -2377,7 +2482,7 @@ TEMPLATE_FILES["mediation_list.html"] = r"""{% extends "base.html" %}
 
 
 TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
-{% block title %}Mediation Builder · Mediation Tool{% endblock %}
+{% block title %}Mediation Builder · Flow{% endblock %}
 {% block content %}
 <section class="page-head">
   <p class="eyebrow">Builder</p>
@@ -2459,6 +2564,14 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
       </div>
     </fieldset>
 
+    <div class="report-source" style="margin:4px 0 14px">
+      <span class="lbl" style="display:block;margin-bottom:6px">eCPM source</span>
+      <div class="radio-row">
+        <label><input type="radio" name="report_type" value="mediation" checked /> <span><b>Mediation</b> — Observed eCPM (matches AdMob UI · recommended)</span></label>
+        <label><input type="radio" name="report_type" value="network" /> <span><b>Network</b> — AdMob Network only</span></label>
+      </div>
+    </div>
+
     <div class="form-actions">
       <button class="btn-primary" id="fetch-report-btn" disabled>📊 Fetch AdMob Report (Last 7 Days)</button>
       <a href="/mediation" class="btn-ghost">Cancel</a>
@@ -2473,6 +2586,19 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
     </div>
   </div>
 </div>
+
+<!-- Full-screen blocker shown while a push runs: progress bar + count + message.
+     position:fixed + high z-index so the user can't click anything else. -->
+<div id="push-overlay" style="display:none">
+  <div class="push-modal">
+    <h3 class="push-title">Creating mediation groups…</h3>
+    <div class="push-count"><span id="push-done">0</span> / <span id="push-total">0</span></div>
+    <div class="push-bar"><div class="push-bar-fill" id="push-bar-fill"></div></div>
+    <p class="push-msg" id="push-msg">Starting…</p>
+    <p class="push-note">Please keep this tab open — this can take a minute.</p>
+  </div>
+</div>
+<div id="snackbar"></div>
 
 <section id="report-section" style="display:none">
   <h2 class="section-title">Ad Unit Reports</h2>
@@ -2539,8 +2665,14 @@ const state = {
   unique_names: true,
   include_bidding_networks: true,
   name_prefix: "Global",
+  report_type: "mediation",
   report: null,
 };
+
+// eCPM source toggle (Mediation = matches AdMob UI / Network = AdMob Network only)
+$$('input[name="report_type"]').forEach(r => r.addEventListener("change", () => {
+  state.report_type = document.querySelector('input[name="report_type"]:checked').value;
+}));
 
 // Wire the "Include All Bidding Networks" toggle (default ON).
 const __incBidCb = document.getElementById("include-bidding");
@@ -2616,7 +2748,7 @@ function renderCountries() {
     chip.textContent = `${c.code} · ${c.name}`;
     chip.addEventListener("click", () => {
       if (on) state.countries.delete(c.code); else state.countries.add(c.code);
-      renderCountries(); updatePreview();
+      updateAutoPrefix(); renderCountries(); updatePreview();
     });
     wrap.appendChild(chip);
   });
@@ -2696,18 +2828,29 @@ $("#app-select").addEventListener("change", e => {
 $("#adunit-search").addEventListener("input", renderAdUnits);
 $("#adunit-all").addEventListener("click", () => { state.ad_units = [...(APP_AD_UNITS[state.app_id] || [])]; renderAdUnits(); updatePreview(); });
 $("#adunit-none").addEventListener("click", () => { state.ad_units = []; renderAdUnits(); updatePreview(); });
+// When countries are chosen, auto-fill the group name prefix (US, US_GB, ...)
+// so the user doesn't type it by hand. Manual edits afterwards still stick
+// until the country selection changes again.
+function updateAutoPrefix() {
+  let p;
+  if (state.country_mode === "GLOBAL" || state.countries.size === 0) p = "Global";
+  else p = [...state.countries].slice(0, 4).join("_") + (state.countries.size > 4 ? "_etc" : "");
+  const inp = $("#name-prefix");
+  if (inp) inp.value = p;
+  state.name_prefix = p;
+}
 $$('input[name="country_mode"]').forEach(r => r.addEventListener("change", () => {
   const mode = document.querySelector('input[name="country_mode"]:checked').value;
   state.country_mode = mode;
   $("#country-picker").style.display = mode === "GLOBAL" ? "none" : "";
   if (mode === "GLOBAL") state.countries.clear();
   if (mode !== "GLOBAL") renderCountries();
-  updatePreview();
+  updateAutoPrefix(); updatePreview();
 }));
 $("#country-search").addEventListener("input", renderCountries);
 $("#country-paste").addEventListener("change", e => {
   e.target.value.split(",").map(s => s.trim().toUpperCase()).filter(Boolean).forEach(c => state.countries.add(c));
-  renderCountries(); updatePreview();
+  updateAutoPrefix(); renderCountries(); updatePreview();
 });
 $("#line-count").addEventListener("change", e => { state.line_count = Math.max(1, Math.min(MAX_LINES, +e.target.value || DEFAULT_LINES)); updatePreview(); if (state.report) renderReport(); });
 $("#name-prefix").addEventListener("input", e => { state.name_prefix = e.target.value || "Group"; updatePreview(); });
@@ -2723,6 +2866,7 @@ $("#fetch-report-btn").addEventListener("click", async () => {
         ad_unit_ids,
         country_mode: state.country_mode,
         countries: [...state.countries],
+        report_type: state.report_type,
       }),
     });
     const data = await res.json();
@@ -2730,7 +2874,9 @@ $("#fetch-report-btn").addEventListener("click", async () => {
     state.report = data.report || {};
     const geo = (data.countries && data.countries.length)
       ? `Geo: ${data.countries.join(", ")}` : "Geo: Global (all countries)";
-    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo}`;
+    const src = (data.report_type === "network")
+      ? "Source: Network (AdMob Network)" : "Source: Mediation (Observed eCPM)";
+    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo} · ${src}`;
     renderReport();
     $("#report-section").style.display = "";
     $("#report-section").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -2800,6 +2946,53 @@ function renderReport() {
   });
 }
 
+function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+function showSnackbar(text) {
+  const sb = document.getElementById("snackbar");
+  if (!sb) return;
+  sb.textContent = text; sb.classList.add("show");
+  clearTimeout(sb._t); sb._t = setTimeout(() => sb.classList.remove("show"), 4000);
+}
+function showPushOverlay(on) {
+  const o = document.getElementById("push-overlay");
+  if (o) o.style.display = on ? "flex" : "none";
+}
+function updatePushProgress(done, total, msg) {
+  done = done || 0; total = total || 0;
+  const pct = total ? Math.round(done / total * 100) : 0;
+  const f = document.getElementById("push-bar-fill"); if (f) f.style.width = pct + "%";
+  const d = document.getElementById("push-done"); if (d) d.textContent = done;
+  const t = document.getElementById("push-total"); if (t) t.textContent = total;
+  const m = document.getElementById("push-msg"); if (m && msg) m.textContent = msg;
+}
+
+// Poll a background push job. Each request is short, so the ~100s proxy limit
+// never triggers no matter how long the actual AdMob push takes. Each poll
+// updates the progress bar + count + snackbar.
+async function pollPushJob(jobId) {
+  let lastDone = -1;
+  for (let i = 0; i < 300; i++) {            // ~12 min ceiling at 2.5s each
+    await _sleep(2500);
+    let r;
+    try { r = await fetch(`/mediation/builder/push-status/${jobId}`); }
+    catch (_) { continue; }                  // transient blip — keep polling
+    if (r.status === 404)
+      throw new Error("Push job not found — open the Mediation page to see if the groups were created.");
+    let j; try { j = JSON.parse(await r.text()); } catch (_) { continue; }
+    if (j.status === "running") {
+      updatePushProgress(j.done, j.total, j.message);
+      if (typeof j.done === "number" && j.done !== lastDone && j.total) {
+        lastDone = j.done;
+        showSnackbar(`${j.done}/${j.total} ad unit(s) created in the background…`);
+      }
+    }
+    if (j.status === "done") { updatePushProgress(j.total, j.total, "Done ✓"); return j.result; }
+    if (j.status === "error") throw new Error(j.error || "Push failed");
+  }
+  throw new Error("Push is taking unusually long. Open the Mediation page to check the created groups.");
+}
+
 async function submitGroups(endpoint, label) {
     const btn = document.getElementById(label === "push" ? "push-btn" : "generate-btn");
     const items = state.ad_units.map(u => {
@@ -2842,8 +3035,35 @@ async function submitGroups(endpoint, label) {
         method: "POST", headers: {"Content-Type": "application/json"},
         body: JSON.stringify(body),
       });
-      const data = await res.json();
+      // The push can be long (many AdMob calls). If it exceeds the proxy's
+      // ~100s limit, the server/proxy returns an HTML error page, not JSON —
+      // parse defensively so we show a clear message instead of a cryptic
+      // "Unexpected token '<'".
+      const text = await res.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch (_) {
+        throw new Error(
+          "The request took too long and the connection timed out.\n\n" +
+          "IMPORTANT: your group(s) may STILL have been created on AdMob — " +
+          "open the Mediation page to check BEFORE retrying (so you don't make duplicates).");
+      }
       if (!res.ok) throw new Error(data.detail || "Request failed");
+
+      // Push runs as a background job — poll until it finishes, with a
+      // blocking overlay + progress bar + snackbar so the user can't touch
+      // anything mid-run. (Save/draft returns directly, no job_id to poll.)
+      if (data.job_id) {
+        btn.textContent = "Working…";
+        showPushOverlay(true);
+        updatePushProgress(0, items.length, "Starting…");
+        showSnackbar(`Creating ${items.length} mediation group(s) in the background…`);
+        try {
+          data = await pollPushJob(data.job_id);
+        } finally {
+          showPushOverlay(false);
+        }
+      }
 
       let msg;
       if (label === "push") {
@@ -2995,8 +3215,7 @@ document.getElementById("push-existing-btn").addEventListener("click", async () 
       const msg = data.status === "ok"
         ? `✓ Patched ${data.lines_pushed} of ${data.lines_requested} lines.`
         : `⚠ Partial: patched ${data.lines_pushed} of ${data.lines_requested} lines.`;
-      alert(msg);
-      window.location = "/mediation";
+      alert(msg + "\n\nYou're still on the Builder. Open /mediation to view all groups.");
     }
   } catch (err) {
     alert("Error: " + err.message);
@@ -3010,7 +3229,7 @@ updatePreview();
 {% endblock %}"""
 
 TEMPLATE_FILES["mediation_detail.html"] = r"""{% extends "base.html" %}
-{% block title %}{{ group.name }} · Mediation Tool{% endblock %}
+{% block title %}{{ group.name }} · Flow{% endblock %}
 {% block content %}
 <section class="page-head row-between">
   <div>
@@ -3061,7 +3280,7 @@ TEMPLATE_FILES["mediation_detail.html"] = r"""{% extends "base.html" %}
 {% endblock %}"""
 
 TEMPLATE_FILES["networks.html"] = r"""{% extends "base.html" %}
-{% block title %}Networks · Mediation Tool{% endblock %}
+{% block title %}Networks · Flow{% endblock %}
 {% block content %}
 <section class="page-head">
   <p class="eyebrow">3rd-party networks</p>
@@ -3160,7 +3379,7 @@ document.querySelectorAll(".net-tab").forEach(t => t.addEventListener("click", (
 {% endblock %}"""
 
 TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
-{% block title %}Bidding · Mediation Tool{% endblock %}
+{% block title %}Bidding · Flow{% endblock %}
 {% block content %}
 <section class="page-head">
   <p class="eyebrow">Bidding setup</p>
@@ -3641,6 +3860,16 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .country-chip { background: var(--bg-3); border: 1px solid var(--line-2); color: var(--ink-dim); padding: 6px 10px; border-radius: 999px; font-family: var(--font-mono); font-size: 12px; cursor: pointer; }
 .country-chip:hover { border-color: var(--ink-mute); }
 .country-chip.is-selected { background: rgba(244,185,66,0.16); color: var(--accent); border-color: var(--accent); }
+#push-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.74); z-index: 9999; display: flex; align-items: center; justify-content: center; }
+.push-modal { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: var(--radius-lg); padding: 28px 32px; width: min(440px, 90vw); text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.55); }
+.push-title { font-family: var(--font-display); font-size: 18px; font-weight: 500; margin: 0 0 14px; }
+.push-count { font-family: var(--font-mono); font-size: 32px; color: var(--accent); margin-bottom: 14px; letter-spacing: 1px; }
+.push-bar { height: 12px; background: var(--bg-3); border-radius: 999px; overflow: hidden; border: 1px solid var(--line); }
+.push-bar-fill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width .35s ease; }
+.push-msg { color: var(--ink-dim); font-size: 13px; margin: 14px 0 4px; min-height: 18px; }
+.push-note { color: var(--ink-mute); font-size: 11.5px; margin: 0; }
+#snackbar { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%); background: var(--bg-2); border: 1px solid var(--accent); color: var(--ink); padding: 12px 20px; border-radius: 10px; font-size: 13px; z-index: 10000; opacity: 0; pointer-events: none; transition: opacity .25s ease; box-shadow: 0 8px 30px rgba(0,0,0,0.45); max-width: 90vw; }
+#snackbar.show { opacity: 1; }
 .report-card { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 18px 20px; margin-bottom: 16px; }
 .report-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
 .report-card-title { font-family: var(--font-display); font-size: 18px; font-weight: 500; }
@@ -3891,6 +4120,22 @@ async def lifespan(_: "FastAPI"):
     print(bar, flush=True)
     print(flush=True)
     _log(f"server ready (build={BUILD_TAG}, mtime={mtime})")
+    # Surface the DB location + whether it already holds data, so an empty /
+    # non-persistent database is obvious at a glance (instead of silently
+    # looking like "the data disappeared" after a redeploy without a volume).
+    try:
+        _dbf = make_url(settings.database_url).database if _is_sqlite else "(remote DB)"
+        _s = SessionLocal()
+        try:
+            _u = _s.query(User).count(); _a = _s.query(AdMobApp).count()
+        finally:
+            _s.close()
+        _log(f"database: {_dbf}  ->  {_u} user(s), {_a} app(s) cached")
+        if _is_sqlite and _dbf and "/app/data" not in _dbf and "data" not in os.path.basename(os.path.dirname(_dbf or '.')):
+            _log("  NOTE: SQLite is NOT under a 'data/' volume dir — mount one "
+                 "(-v ./data:/app/data) so data survives container redeploys.")
+    except Exception as _e:
+        _log(f"  warning: DB status check failed ({_e})")
     _log(f"log file: {log_abs}")
     _log("when you click push in the browser, step-by-step logs will appear here AND in flow.log")
     yield
@@ -3903,7 +4148,7 @@ async def lifespan(_: "FastAPI"):
 # fetch().json() blow up with "Unexpected token 'T', Traceback ...".
 # Our handler below already prints the full traceback to the server console,
 # so we're not losing any debug info.
-app = FastAPI(title="AdMob Mediation Tool", debug=False, lifespan=lifespan)
+app = FastAPI(title="Flow", debug=False, lifespan=lifespan)
 # same_site="lax" lets the session cookie survive the Google -> /auth/callback
 # top-level redirect. The cookie is always HttpOnly (JS can't read it) and is
 # signed with secret_key. In production set cookie_secure=true so it is only
@@ -4652,11 +4897,17 @@ def builder_fetch_report(payload: dict = Body(...), db: Session = Depends(get_db
     country_mode = (payload.get("country_mode") or "GLOBAL").upper()
     raw_countries = [str(c).upper() for c in (payload.get("countries") or [])]
     countries = raw_countries if (country_mode == "INCLUDE" and raw_countries) else []
-    start, end = _days_ago_iso(6), _today_iso()
+    # Last 7 COMPLETE days, ending YESTERDAY — NOT including today. Today is an
+    # incomplete day (data still accumulating) and AdMob's UI "Last 7 days"
+    # likewise excludes it. Including today previously skewed eCPM and shifted
+    # the window by one day vs what AdMob shows (e.g. 23-29 instead of 22-28).
+    start, end = _days_ago_iso(7), _days_ago_iso(1)
+    # eCPM source toggle: "mediation" (default, matches AdMob UI) or "network".
+    report_type = "network" if str(payload.get("report_type") or "").lower() == "network" else "mediation"
     try:
         client = AdMobClient(db, user)
         report = client.fetch_network_report_for_ad_units(
-            ad_unit_ids, start, end, countries=countries)
+            ad_unit_ids, start, end, countries=countries, report_type=report_type)
     except AdMobAPIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     for au in ad_unit_ids:
@@ -4665,18 +4916,76 @@ def builder_fetch_report(payload: dict = Body(...), db: Session = Depends(get_db
             "revenue_usd": 0.0, "ecpm_usd": 0.0, "rpm_usd": 0.0,
             "match_rate": 0.0, "show_rate": 0.0, "fill_rate": 0.0, "ctr": 0.0,
         })
-    return {"start": start, "end": end, "report": report,
+    return {"start": start, "end": end, "report": report, "report_type": report_type,
             "countries": countries, "scope": "GLOBAL" if not countries else "COUNTRY"}
 
 
 @med_router.post("/builder/generate")
 def builder_generate(payload: dict = Body(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    # Saving a draft does NO AdMob calls, so it's fast — keep it synchronous.
     return _generate_groups(payload, db, user, push_to_admob=False)
+
+
+# ---------------------------------------------------------------------------
+# Background push jobs. Pushing to AdMob makes many sequential API calls and can
+# run for minutes — longer than a reverse proxy / Cloudflare Tunnel's ~100s HTTP
+# limit, which would otherwise return an HTML timeout page (the "Unexpected
+# token '<'" error). So the push runs in a background thread and the browser
+# polls a short status endpoint instead of holding one long request open.
+_PUSH_JOBS: dict[str, dict] = {}
+_PUSH_JOBS_LOCK = threading.Lock()
+
+
+def _run_push_job(job_id: str, payload: dict, user_id: int) -> None:
+    job_db = SessionLocal()
+    try:
+        job_user = job_db.query(User).filter(User.id == user_id).first()
+        if job_user is None:
+            raise RuntimeError("User not found for push job")
+
+        def _progress(done: int, total: int, message: str) -> None:
+            with _PUSH_JOBS_LOCK:
+                cur = _PUSH_JOBS.get(job_id, {})
+                cur.update({"status": "running", "done": done,
+                            "total": total, "message": message})
+                _PUSH_JOBS[job_id] = cur
+
+        result = _generate_groups(payload, job_db, job_user,
+                                  push_to_admob=True, progress=_progress)
+        with _PUSH_JOBS_LOCK:
+            _PUSH_JOBS[job_id] = {"status": "done", "result": result}
+    except Exception as e:  # noqa: BLE001 — surface any failure to the poller
+        import traceback
+        traceback.print_exc()
+        with _PUSH_JOBS_LOCK:
+            _PUSH_JOBS[job_id] = {"status": "error", "error": str(e)}
+    finally:
+        job_db.close()
 
 
 @med_router.post("/builder/push-to-admob")
 def builder_push_to_admob(payload: dict = Body(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
-    return _generate_groups(payload, db, user, push_to_admob=True)
+    job_id = uuid.uuid4().hex
+    with _PUSH_JOBS_LOCK:
+        # keep the table small — drop finished jobs once we have a lot
+        if len(_PUSH_JOBS) > 50:
+            for k in [k for k, v in _PUSH_JOBS.items() if v.get("status") != "running"][:40]:
+                _PUSH_JOBS.pop(k, None)
+        _PUSH_JOBS[job_id] = {"status": "running", "done": 0,
+                              "total": len(payload.get("items") or []),
+                              "message": "Starting…"}
+    threading.Thread(target=_run_push_job, args=(job_id, payload, user.id),
+                     daemon=True).start()
+    return {"job_id": job_id, "status": "running"}
+
+
+@med_router.get("/builder/push-status/{job_id}")
+def builder_push_status(job_id: str, user: User = Depends(current_user)):
+    with _PUSH_JOBS_LOCK:
+        job = _PUSH_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Push job not found (it may have finished long ago — check /mediation)")
+    return job
 
 
 @med_router.post("/builder/fetch-admob-groups")
@@ -4801,7 +5110,10 @@ def _build_waterfall_lines_from_credentials(
             continue
 
         if pending > 0:
-            time.sleep(1.2)
+            # Light throttle between per-network source-mapping creates (the
+            # quota-retry helper handles real saturation). Was 1.2s — lowered
+            # to keep the push fast when several bidding networks are enabled.
+            time.sleep(0.3)
         pending += 1
 
         suffix = source_ad_unit_id.split("/")[-1][-8:]
@@ -4865,7 +5177,8 @@ def _build_waterfall_lines_from_credentials(
 # ============================================================================
 # Core builder: per source ad unit, create tier ad units + one mediation group
 # ============================================================================
-def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool):
+def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool,
+                     progress=None):
     """For each selected source ad unit, build a real AdMob mediation group
     via the public v1alpha API:
 
@@ -4936,6 +5249,11 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
         ]
         if not ecpms:
             continue
+        if progress:
+            # done = items fully finished before this one; we're now starting
+            # this one. Frontend renders bar + "done/total" + this message.
+            progress(item_idx - 1, len(items),
+                     f"Creating group {item_idx}/{len(items)}: {ad_unit_name}")
         _log(f"---- [{item_idx}/{len(items)}] source ad_unit={ad_unit_id} "
              f"name={ad_unit_name!r} tiers={len(ecpms)} ----")
 
@@ -5219,6 +5537,11 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
         _log(f"     item DONE status={group_status} "
              f"admob_group_id={admob_group_id or '-'} "
              f"waterfall_lines={manual_actual} bidding_lines={live_actual}")
+        if progress:
+            # Report AFTER this group is actually created, so the count ticks
+            # up 1, 2, 3, ... exactly as each one finishes.
+            progress(item_idx, len(items),
+                     f"Created {item_idx}/{len(items)}: {ad_unit_name}")
 
     total_elapsed = time.time() - overall_start
     _log(f"==== {mode} DONE in {total_elapsed:.2f}s — "

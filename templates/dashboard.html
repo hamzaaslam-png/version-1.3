@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% block title %}Dashboard · Mediation Tool{% endblock %}
+{% block title %}Dashboard · Flow{% endblock %}
 {% block content %}
 <section class="page-head"><p class="eyebrow">Dashboard</p><h1 class="display">Welcome, {{ user.name or user.email }}.</h1></section>
 {% if api_error %}<div class="alert alert-warn"><strong>AdMob API:</strong> {{ api_error }}</div>{% endif %}

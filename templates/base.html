@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{% block title %}AdMob Mediation Tool{% endblock %}</title>
+  <title>{% block title %}Flow{% endblock %}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -11,7 +11,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><a href="/" class="brand-link"><span class="brand-mark">⌬</span><span class="brand-name">Mediation<span class="brand-dot">.</span>Tool</span></a></div>
+    <div class="brand"><a href="/" class="brand-link"><span class="brand-mark">⌬</span><span class="brand-name">Flow</span></a></div>
     <nav class="topnav">
       {% if user and user.id %}
         <a href="/dashboard">Dashboard</a>
@@ -28,6 +28,6 @@
     </nav>
   </header>
   <main class="content">{% block content %}{% endblock %}</main>
-  <footer class="footer"><span>AdMob Mediation Tool</span><span class="footer-sep">·</span><span>1 group per source · Tier ad units · Replicated bidding mappings · Live audit</span></footer>
+  <footer class="footer"><span>Flow</span><span class="footer-sep">·</span><span>1 group per source · Tier ad units · Replicated bidding mappings · Live audit</span></footer>
 </body>
 </html>
