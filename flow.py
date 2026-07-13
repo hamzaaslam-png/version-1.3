@@ -860,6 +860,25 @@ def _days_ago_iso(n: int, tz: str = "America/Los_Angeles") -> str:
     return (_admob_today(tz) - timedelta(days=n)).isoformat()
 
 
+def _waterfall_ad_types(fmt: str) -> list[str]:
+    """AdMob-valid media types for an AdMob Network Waterfall backing ad unit
+    of the given format (v1alpha).
+
+    REWARDED / REWARDED_INTERSTITIAL: RICH_MEDIA and TEXT are REJECTED by the
+    API, but IMAGE and VIDEO are accepted (verified live). Sending only
+    ["VIDEO"] silently dropped image / playable rewarded demand — so we send
+    ["IMAGE", "VIDEO"] to keep that fill.
+
+    Everything else (BANNER, INTERSTITIAL, NATIVE, APP_OPEN): ["RICH_MEDIA",
+    "VIDEO"] — RICH_MEDIA already covers text+image, and AdMob normalises this
+    per format (e.g. it stores NATIVE as RICH_MEDIA only, which is expected —
+    native video is served under RICH_MEDIA)."""
+    fmt = (fmt or "").upper()
+    if fmt in ("REWARDED", "REWARDED_INTERSTITIAL"):
+        return ["IMAGE", "VIDEO"]
+    return ["RICH_MEDIA", "VIDEO"]
+
+
 def _random_suffix(n: int = 6) -> str:
     return "".join(random.choices(string.digits, k=n))
 
@@ -1572,11 +1591,7 @@ class AdMobClient:
                 "AdMob v1alpha service not available — discovery doc "
                 "fetch failed at startup")
         fmt = (ad_format or "").upper()
-        # RICH_MEDIA is rejected for REWARDED / REWARDED_INTERSTITIAL per the
-        # v1alpha schema; for everything else both media types are allowed.
-        ad_types = (["VIDEO"]
-                    if fmt in ("REWARDED", "REWARDED_INTERSTITIAL")
-                    else ["RICH_MEDIA", "VIDEO"])
+        ad_types = _waterfall_ad_types(fmt)
         body = {"requests": [{
             "adMobNetworkWaterfallAdUnit": {
                 "appId": app_id,
@@ -1622,9 +1637,7 @@ class AdMobClient:
         meta: list[str] = []          # parallel: primary ad unit per request
         for r in reqs:
             fmt = (r["ad_format"] or "").upper()
-            ad_types = (["VIDEO"]
-                        if fmt in ("REWARDED", "REWARDED_INTERSTITIAL")
-                        else ["RICH_MEDIA", "VIDEO"])
+            ad_types = _waterfall_ad_types(fmt)
             for (name, ecpm) in r["tiers"]:
                 flat.append({"adMobNetworkWaterfallAdUnit": {
                     "appId": r["app_id"],
@@ -4867,8 +4880,29 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.3.5"
+APP_VERSION = "1.3.6"
 CHANGELOG = [
+    {
+        "version": "1.3.6",
+        "date": "2026-07-13",
+        "title": "Fix rewarded ad types (image + video, not video only)",
+        "changes": [
+            "Rewarded and Rewarded Interstitial waterfall ad units were being "
+            "created with VIDEO only. AdMob rejects RICH_MEDIA for these formats, "
+            "but it DOES accept IMAGE — so 'video only' silently dropped all "
+            "image / playable rewarded demand. They are now created with IMAGE + "
+            "VIDEO (verified against the live AdMob API), recovering that fill and "
+            "revenue.",
+            "Other formats are unchanged and correct: Banner / Interstitial / "
+            "Native / App Open use RICH_MEDIA + VIDEO. (Native is stored by AdMob "
+            "as RICH_MEDIA — that is expected; native video serves under "
+            "RICH_MEDIA. Banner works with RICH_MEDIA + VIDEO.)",
+            "IMPORTANT: an ad unit's ad types are fixed when it's created and "
+            "can't be changed afterwards. Existing rewarded tier units keep their "
+            "old VIDEO-only type — RE-PUSH those rewarded groups to rebuild them "
+            "with IMAGE + VIDEO.",
+        ],
+    },
     {
         "version": "1.3.5",
         "date": "2026-07-13",
