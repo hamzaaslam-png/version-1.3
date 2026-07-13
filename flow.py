@@ -1026,6 +1026,13 @@ class AdMobClient:
                 "dimensions": ["AD_UNIT"],
                 "dimensionFilters": dimension_filters,
                 "metrics": metrics,
+                # CRITICAL: force USD. Without this the AdMob reporting API
+                # returns money (ESTIMATED_EARNINGS, OBSERVED_ECPM) in the
+                # ACCOUNT's local currency (e.g. AED), which the code then
+                # reads as if it were USD — inflating every eCPM/revenue by the
+                # FX rate (AED = 3.6725, so ~3.67x too high). Requesting USD
+                # makes the numbers match the AdMob UI exactly.
+                "localizationSettings": {"currencyCode": "USD"},
             }
         }
         report_res = (self.service.accounts().mediationReport()
@@ -4737,8 +4744,25 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.3.1"
+APP_VERSION = "1.3.2"
 CHANGELOG = [
+    {
+        "version": "1.3.2",
+        "date": "2026-07-13",
+        "title": "Critical fix: eCPM / revenue now in USD (matches AdMob)",
+        "changes": [
+            "Fixed a major reporting bug: the AdMob API returns earnings and eCPM "
+            "in the account's LOCAL currency (e.g. UAE Dirham) unless a currency "
+            "is requested. The tool was reading those values as US dollars, which "
+            "inflated every eCPM and revenue figure by the exchange rate "
+            "(AED = 3.6725, so numbers were ~3.67x too high).",
+            "The report now explicitly requests USD, so eCPM, revenue, and RPM "
+            "match the AdMob dashboard exactly (e.g. $3.44 -> $0.94).",
+            "IMPORTANT: waterfalls created before this fix used the inflated base "
+            "eCPM, so their tier floors were ~3.67x too high. Re-fetch the report "
+            "and re-push those groups to get correct USD-based floors.",
+        ],
+    },
     {
         "version": "1.3.1",
         "date": "2026-07-13",
