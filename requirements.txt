@@ -15,3 +15,7 @@ google-api-python-client==2.196.0
 # Postgres driver — required when DATABASE_URL points at a managed Postgres
 # (Neon/Supabase) in production. Harmless to include for local SQLite runs.
 psycopg2-binary==2.9.10
+# IANA timezone database so ZoneInfo can resolve the account's reporting
+# timezone (e.g. Asia/Dubai) on hosts without a system tz db (Windows / slim
+# containers) — used to compute the "last 7 days" report window per account.
+tzdata==2025.2

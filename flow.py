@@ -828,21 +828,36 @@ def _date_parts(yyyy_mm_dd: str) -> dict:
     return {"year": int(y), "month": int(m), "day": int(d)}
 
 
-def _admob_today():
-    """Today's date in AdMob's reporting timezone (America/Los_Angeles)."""
+# Fallback UTC offsets (hours) for when the tz database (tzdata) isn't
+# installed. Covers common AdMob reporting zones; anything else -> UTC.
+_TZ_OFFSETS = {
+    "America/Los_Angeles": -8, "America/New_York": -5, "America/Chicago": -6,
+    "Asia/Dubai": 4, "Asia/Karachi": 5, "Asia/Kolkata": 5.5, "Asia/Riyadh": 3,
+    "Asia/Singapore": 8, "Asia/Tokyo": 9, "Europe/London": 0,
+    "Europe/Berlin": 1, "Europe/Paris": 1, "Australia/Sydney": 10, "UTC": 0,
+}
+
+
+def _admob_today(tz: str = "America/Los_Angeles"):
+    """Today's date in the AdMob REPORTING timezone. Pass the account's own
+    `reportingTimeZone` (e.g. 'Asia/Dubai') so the date window lines up exactly
+    with what that account's AdMob dashboard shows. Falls back to a fixed UTC
+    offset if the tz database isn't available on the host."""
+    tz = tz or "America/Los_Angeles"
     try:
         from zoneinfo import ZoneInfo
-        return datetime.now(ZoneInfo("America/Los_Angeles")).date()
+        return datetime.now(ZoneInfo(tz)).date()
     except Exception:
-        return (datetime.utcnow() - timedelta(hours=8)).date()
+        off = _TZ_OFFSETS.get(tz, 0)
+        return (datetime.utcnow() + timedelta(hours=off)).date()
 
 
-def _today_iso() -> str:
-    return _admob_today().isoformat()
+def _today_iso(tz: str = "America/Los_Angeles") -> str:
+    return _admob_today(tz).isoformat()
 
 
-def _days_ago_iso(n: int) -> str:
-    return (_admob_today() - timedelta(days=n)).isoformat()
+def _days_ago_iso(n: int, tz: str = "America/Los_Angeles") -> str:
+    return (_admob_today(tz) - timedelta(days=n)).isoformat()
 
 
 def _random_suffix(n: int = 6) -> str:
@@ -993,6 +1008,25 @@ class AdMobClient:
         self._account_currency = cur
         return cur
 
+    def get_account_timezone(self) -> str:
+        """The AdMob account's reporting timezone (e.g. 'Asia/Dubai'). Used to
+        compute the report date window so 'last 7 days' matches this account's
+        AdMob dashboard exactly, regardless of where the server runs. Defaults
+        to AdMob's classic 'America/Los_Angeles' if unavailable."""
+        if getattr(self, "_account_tz", None):
+            return self._account_tz
+        tz = "America/Los_Angeles"
+        try:
+            pub = self.get_publisher_id()
+            for a in (self.list_accounts() or []):
+                if a.get("publisherId") == pub and a.get("reportingTimeZone"):
+                    tz = a["reportingTimeZone"]
+                    break
+        except Exception:
+            pass
+        self._account_tz = tz
+        return tz
+
     def get_usd_to_account_fx(self) -> float:
         """Multiplier to turn a USD amount into the ACCOUNT currency — used at
         push time to convert USD tier eCPMs into the currency AdMob stores
@@ -1007,7 +1041,8 @@ class AdMobClient:
         fx = 1.0
         try:
             parent = f"accounts/{self.get_publisher_id()}"
-            start, end = _days_ago_iso(30), _days_ago_iso(1)
+            tz = self.get_account_timezone()
+            start, end = _days_ago_iso(30, tz), _days_ago_iso(1, tz)
 
             def _total(ccy: str) -> float:
                 body = {"reportSpec": {
@@ -4832,8 +4867,24 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.3.4"
+APP_VERSION = "1.3.5"
 CHANGELOG = [
+    {
+        "version": "1.3.5",
+        "date": "2026-07-13",
+        "title": "Report window uses your account timezone (exact AdMob match)",
+        "changes": [
+            "The 'last 7 days' report window is now calculated in your AdMob "
+            "account's own reporting timezone (e.g. Asia/Dubai) instead of a "
+            "fixed US timezone. Previously, for part of each day the tool and "
+            "AdMob were on different calendar dates, shifting the 7-day window by "
+            "a day and making totals not quite match — now they line up exactly.",
+            "Bundled the timezone database (tzdata) so this works on any host, "
+            "including Windows and slim containers.",
+            "So: same 7 complete days as your AdMob dashboard (today excluded), "
+            "in your account's timezone — figures match to the number.",
+        ],
+    },
     {
         "version": "1.3.4",
         "date": "2026-07-13",
@@ -5876,15 +5927,17 @@ def builder_fetch_report(payload: dict = Body(...), db: Session = Depends(get_db
     country_mode = (payload.get("country_mode") or "GLOBAL").upper()
     raw_countries = [str(c).upper() for c in (payload.get("countries") or [])]
     countries = raw_countries if (country_mode == "INCLUDE" and raw_countries) else []
-    # Last 7 COMPLETE days, ending YESTERDAY — NOT including today. Today is an
-    # incomplete day (data still accumulating) and AdMob's UI "Last 7 days"
-    # likewise excludes it. Including today previously skewed eCPM and shifted
-    # the window by one day vs what AdMob shows (e.g. 23-29 instead of 22-28).
-    start, end = _days_ago_iso(7), _days_ago_iso(1)
     # eCPM source toggle: "mediation" (default, matches AdMob UI) or "network".
     report_type = "network" if str(payload.get("report_type") or "").lower() == "network" else "mediation"
     try:
         client = AdMobClient(db, user)
+        # Last 7 COMPLETE days, ending YESTERDAY — NOT including today (today is
+        # still accumulating and AdMob's "Last 7 days" excludes it too). The
+        # window is computed in THIS ACCOUNT's reporting timezone (e.g.
+        # Asia/Dubai) so it lines up exactly with the account's AdMob dashboard;
+        # using the server's timezone could shift the window by a day.
+        tz = client.get_account_timezone()
+        start, end = _days_ago_iso(7, tz), _days_ago_iso(1, tz)
         report = client.fetch_network_report_for_ad_units(
             ad_unit_ids, start, end, countries=countries, report_type=report_type)
     except AdMobAPIError as e:
