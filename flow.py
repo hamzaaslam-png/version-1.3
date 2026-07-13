@@ -2263,7 +2263,7 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="/static/style.css?v={{ app_version }}" />
 </head>
 <body>
   <header class="topbar">
@@ -4737,8 +4737,25 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.3"
+APP_VERSION = "1.3.1"
 CHANGELOG = [
+    {
+        "version": "1.3.1",
+        "date": "2026-07-13",
+        "title": "Fix: returning users seeing the old cached page",
+        "changes": [
+            "Fixed a caching problem where users who had opened the tool before "
+            "the redesign could still see the OLD interface (and its old numbers) "
+            "because their browser or the Cloudflare edge was serving a stale copy "
+            "of the page.",
+            "HTML pages are now always re-fetched fresh (no-store), and the "
+            "stylesheet is versioned per release, so an update is picked up "
+            "immediately — no more mismatched old UI or stale eCPM values.",
+            "Note: the eCPM the server calculates was already correct (AdMob "
+            "Mediation 'Observed eCPM'); the old figure some users saw came only "
+            "from a cached old page, not from a wrong calculation.",
+        ],
+    },
     {
         "version": "1.3",
         "date": "2026-07-13",
@@ -4944,6 +4961,16 @@ async def _security_headers(request: Request, call_next):
     # HSTS only matters over HTTPS (production).
     if settings.cookie_secure:
         resp.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    # Never let a browser / Cloudflare edge serve a STALE HTML page. The page
+    # markup carries the inline JS that renders reports and computes waterfall
+    # eCPMs, so a cached old page would show old UI AND old numbers. Forcing a
+    # revalidate on every HTML response guarantees returning users always get
+    # the current code. (Static CSS/JS are versioned via ?v=<app_version>.)
+    ctype = resp.headers.get("content-type", "")
+    if ctype.startswith("text/html"):
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
     return resp
 
 
