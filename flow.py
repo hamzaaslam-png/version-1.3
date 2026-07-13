@@ -308,7 +308,7 @@ NETWORK_CATALOG = [
         "supports_formats": ["BANNER", "INTERSTITIAL", "NATIVE", "REWARDED",
                              "REWARDED_INTERSTITIAL", "APP_OPEN"],
         "app_fields": [
-            {"key": "sdk_key", "label": "SDK Key", "type": "password",
+            {"key": "sdk_key", "label": "SDK Key", "type": "text",
              "admob_key": "sdk_key",
              "help": "AppLovin dashboard → Account → Keys"},
         ],
@@ -345,7 +345,7 @@ NETWORK_CATALOG = [
         "supports_bidding": True,
         "supports_formats": ["BANNER", "INTERSTITIAL", "REWARDED", "APP_OPEN"],
         "app_fields": [
-            {"key": "app_key", "label": "App Key", "type": "password",
+            {"key": "app_key", "label": "App Key", "type": "text",
              "admob_key": "app_key",
              "help": "ironSource dashboard → My Apps"},
         ],
@@ -367,7 +367,7 @@ NETWORK_CATALOG = [
             {"key": "app_id", "label": "App ID", "type": "text",
              "admob_key": "app_id",
              "help": "Mintegral dashboard → Apps"},
-            {"key": "app_key", "label": "App Key", "type": "password",
+            {"key": "app_key", "label": "App Key", "type": "text",
              "admob_key": "app_key",
              "help": "Mintegral dashboard → Apps"},
         ],
