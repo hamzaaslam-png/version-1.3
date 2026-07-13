@@ -1482,6 +1482,132 @@ class AdMobClient:
             raise AdMobAPIError(_format_http_error(e)) from e
         return r.get("adMobNetworkWaterfallAdUnits", []) or []
 
+    def batch_create_waterfall_ad_units_multi(
+        self, reqs: list[dict], chunk: int = 50,
+    ) -> tuple[dict[str, list[dict]], set]:
+        """Create the tier backing units for MANY source ad units in a few
+        batchCreate calls instead of one call per group. Cuts a 12-group push
+        from 12 batchCreate round-trips to ~2-3 (the AdMob write latency +
+        quota backoff per call is what makes big pushes slow).
+
+        reqs: [{app_id, primary_ad_unit_id, ad_format,
+                tiers: [(display_name, ecpm), ...]}, ...]
+        Returns ({primary_ad_unit_id: [unit, ...] in tier order},
+                 failed_primaries) — callers fall back to the per-group call
+        for any primary in failed_primaries, so a failed chunk never kills
+        the whole push and never double-creates units from healthy chunks.
+        """
+        if self.service_alpha is None:
+            raise AdMobAPIError(
+                "AdMob v1alpha service not available — discovery doc "
+                "fetch failed at startup")
+        flat: list[dict] = []
+        meta: list[str] = []          # parallel: primary ad unit per request
+        for r in reqs:
+            fmt = (r["ad_format"] or "").upper()
+            ad_types = (["VIDEO"]
+                        if fmt in ("REWARDED", "REWARDED_INTERSTITIAL")
+                        else ["RICH_MEDIA", "VIDEO"])
+            for (name, ecpm) in r["tiers"]:
+                flat.append({"adMobNetworkWaterfallAdUnit": {
+                    "appId": r["app_id"],
+                    "displayName": (name or "")[:80],
+                    "format": fmt,
+                    "adTypes": ad_types,
+                    "cpmFloorSettings": {
+                        "globalFloorMicros":
+                            str(int(round(float(ecpm) * 1_000_000)))
+                    },
+                    "mappingSetting": {
+                        "primaryAdUnitId": r["primary_ad_unit_id"]},
+                }})
+                meta.append(r["primary_ad_unit_id"])
+        out: dict[str, list[dict]] = {}
+        failed: set = set()
+        parent = f"accounts/{self.get_publisher_id()}"
+        for i in range(0, len(flat), chunk):
+            c_reqs = flat[i:i + chunk]
+            c_meta = meta[i:i + chunk]
+            try:
+                resp = self._with_quota_retry(
+                    lambda c=c_reqs: self.service_alpha.accounts()
+                    .adMobNetworkWaterfallAdUnits().batchCreate(
+                        parent=parent, body={"requests": c}).execute()
+                )
+                units = resp.get("adMobNetworkWaterfallAdUnits", []) or []
+                if len(units) != len(c_reqs):
+                    raise AdMobAPIError(
+                        f"batchCreate returned {len(units)} units for "
+                        f"{len(c_reqs)} requests — order can't be trusted")
+                for prim, u in zip(c_meta, units):
+                    out.setdefault(prim, []).append(u)
+            except AdMobAPIError as e:
+                _log(f"  multi-batchCreate chunk failed "
+                     f"({len(c_reqs)} reqs): {e} — those groups will use "
+                     f"the per-group call instead")
+                failed.update(c_meta)
+        # A primary with any failed chunk must be fully per-group re-created.
+        for prim in failed:
+            out.pop(prim, None)
+        return out, failed
+
+    def batch_create_bidding_mappings(
+        self, reqs: list[dict], chunk: int = 50,
+    ) -> dict[tuple, str]:
+        """Create MANY bidding AdUnitMappings in a few batchCreate calls
+        (instead of one create per source ad unit per network).
+
+        reqs: [{ad_unit_id, network_code, adapter_id, configs, display_name}]
+        Returns {(ad_unit_id, network_code): mapping_resource_name}. Pairs
+        from a failed chunk are simply absent — the caller falls back to the
+        old per-item create for them.
+        """
+        if self.service_alpha is None:
+            raise AdMobAPIError(
+                "AdMob v1alpha service not available — discovery doc "
+                "fetch failed at startup")
+        pub = self.get_publisher_id()
+        flat: list[dict] = []
+        meta: list[tuple] = []
+        for r in reqs:
+            short = (r["ad_unit_id"].split("/")[-1]
+                     if "/" in r["ad_unit_id"] else r["ad_unit_id"])
+            flat.append({
+                "parent": f"accounts/{pub}/adUnits/{short}",
+                "adUnitMapping": {
+                    "displayName": (r["display_name"] or "")[:80],
+                    "adapterId": r["adapter_id"],
+                    "adUnitConfigurations": r["configs"],
+                    "state": "ENABLED",
+                },
+            })
+            meta.append((r["ad_unit_id"], r["network_code"]))
+        out: dict[tuple, str] = {}
+        for i in range(0, len(flat), chunk):
+            c_reqs = flat[i:i + chunk]
+            c_meta = meta[i:i + chunk]
+            try:
+                resp = self._with_quota_retry(
+                    lambda c=c_reqs: self.service_alpha.accounts()
+                    .adUnitMappings().batchCreate(
+                        parent=f"accounts/{pub}",
+                        body={"requests": c}).execute()
+                )
+                mps = resp.get("adUnitMappings", []) or []
+                if len(mps) != len(c_reqs):
+                    raise AdMobAPIError(
+                        f"batchCreate returned {len(mps)} mappings for "
+                        f"{len(c_reqs)} requests")
+                for key, mp in zip(c_meta, mps):
+                    name = mp.get("name", "") or ""
+                    if name:
+                        out[key] = name
+            except AdMobAPIError as e:
+                _log(f"  bidding multi-batchCreate chunk failed "
+                     f"({len(c_reqs)} reqs): {e} — those mappings will be "
+                     f"created per-item instead")
+        return out
+
     # ========================================================================
     # NEW (FIX): replicate source ad unit's bidding mappings to tier ad units
     # ========================================================================
@@ -4176,6 +4302,11 @@ CHANGELOG = [
             "Builder: click ANYWHERE on an ad-unit card to select it (not just "
             "the button); selected ad units are listed in the Live Preview panel "
             "and can be removed from there.",
+            "Push speed: multi-group pushes now pre-create ALL tier ad units and "
+            "ALL bidding mappings in a few batched AdMob calls (~70% fewer API "
+            "round-trips) — a 12-group push makes ~16 calls instead of ~48. "
+            "If a batch fails, those groups automatically fall back to the "
+            "previous per-group calls.",
         ],
     },
     {
@@ -5382,6 +5513,113 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
     push_errors: list[dict] = []
     push_countries = countries if country_mode == "INCLUDE" else []
 
+    # ========================================================================
+    # PRE-BATCH (speed): a push of many groups used to make 2+N AdMob calls
+    # PER group, sequentially — 12 groups easily meant ~48 round-trips and
+    # 10+ minutes once AdMob write latency/backoff stacked up. Here we create
+    # ALL tier backing units and ALL bidding mappings up-front in a handful
+    # of batchCreate calls; the per-group loop then only creates the group
+    # itself (1 call each). Any pre-batch failure falls back to the original
+    # per-group calls, so behaviour is unchanged when batching can't be used.
+    # ========================================================================
+    pre_specs: dict[str, list] = {}          # ad_unit_id -> tier_specs
+    pre_tier_units: dict[str, list] = {}     # ad_unit_id -> backing units
+    pre_bid_mappings: dict[tuple, str] = {}  # (ad_unit_id, network) -> name
+    if push_to_admob and client is not None and len(items) > 1:
+        valid = []
+        for it in items:
+            au = str(it.get("ad_unit_id") or "")
+            ecs = [min(WATERFALL_MAX_ECPM, max(WATERFALL_MIN_ECPM, float(x)))
+                   for x in (it.get("lines") or []) if float(x) > 0]
+            if au and ecs:
+                nm = str(it.get("ad_unit_name") or au)
+                fmt = str(it.get("ad_format") or "BANNER")
+                sorted_ecs = sorted(ecs, reverse=True)
+                specs = [
+                    (f"{nm}_tier{i}_${ec:.2f}".replace(" ", "_")[:80], ec)
+                    for i, ec in enumerate(sorted_ecs, start=1)
+                ]
+                pre_specs[au] = specs
+                valid.append({"app_id": app_row.app_id,
+                              "primary_ad_unit_id": au,
+                              "ad_format": fmt, "tiers": specs})
+        # --- Phase A: all tier backing units in a few batch calls ---
+        if valid:
+            total_tiers = sum(len(v["tiers"]) for v in valid)
+            if progress:
+                progress(0, len(items),
+                         f"Batch-creating {total_tiers} tier ad units for "
+                         f"{len(valid)} group(s)…")
+            _log(f"PRE-BATCH: creating {total_tiers} tier ad units for "
+                 f"{len(valid)} group(s) in one pass")
+            try:
+                pre_tier_units, _failed = _timed(
+                    "batch_create_waterfall_ad_units_multi",
+                    lambda: client.batch_create_waterfall_ad_units_multi(valid),
+                )
+            except AdMobAPIError as e:
+                _log(f"PRE-BATCH tier units failed entirely: {e} — "
+                     f"falling back to per-group calls")
+                pre_tier_units = {}
+        # --- Phase B: all 3P bidding mappings in a few batch calls ---
+        if include_bidding_networks and valid:
+            bid_reqs: list[dict] = []
+            fmt_items: dict[str, list[str]] = {}
+            for v in valid:
+                fmt_items.setdefault(v["ad_format"].upper(), []).append(
+                    v["primary_ad_unit_id"])
+            for fmt_key, au_list in fmt_items.items():
+                rows = db.query(BiddingFormatMapping).filter(
+                    BiddingFormatMapping.user_id == user.id,
+                    BiddingFormatMapping.app_id == app_row.id,
+                    BiddingFormatMapping.ad_format == fmt_key,
+                    BiddingFormatMapping.enabled == True,
+                ).all()
+                for brow in rows:
+                    cat = NETWORK_BY_CODE.get(brow.network_code)
+                    if not cat:
+                        continue
+                    fields = (decrypt_dict(brow.encrypted_fields)
+                              if brow.encrypted_fields else {})
+                    if not any((v or "").strip() for v in fields.values()):
+                        continue
+                    try:
+                        adapter_id, configs, _w = client.build_admob_config_payload(
+                            network_code=brow.network_code,
+                            platform=app_row.platform,
+                            user_fields=fields, ad_format=fmt_key,
+                            for_bidding=True,
+                        )
+                    except AdMobAPIError:
+                        continue  # per-item fallback will surface the error
+                    if not configs:
+                        continue
+                    for au in au_list:
+                        bid_reqs.append({
+                            "ad_unit_id": au,
+                            "network_code": brow.network_code,
+                            "adapter_id": adapter_id,
+                            "configs": configs,
+                            "display_name": (f"{cat['name']} bidding "
+                                             f"{au.split('/')[-1][-6:]}"),
+                        })
+            if bid_reqs:
+                if progress:
+                    progress(0, len(items),
+                             f"Batch-creating {len(bid_reqs)} bidding "
+                             f"mapping(s)…")
+                _log(f"PRE-BATCH: creating {len(bid_reqs)} bidding "
+                     f"mapping(s) in one pass")
+                try:
+                    pre_bid_mappings = _timed(
+                        "batch_create_bidding_mappings",
+                        lambda: client.batch_create_bidding_mappings(bid_reqs),
+                    )
+                except AdMobAPIError as e:
+                    _log(f"PRE-BATCH bidding mappings failed: {e} — "
+                         f"falling back to per-item creates")
+                    pre_bid_mappings = {}
+
     for item_idx, item in enumerate(items, start=1):
         ad_unit_id = str(item.get("ad_unit_id") or "")
         if not ad_unit_id:
@@ -5433,30 +5671,38 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
             # AdUnitMapping on the source ad unit; that mapping is what the
             # MANUAL waterfall line references.
             sorted_ecpms = sorted([e for e in ecpms if e > 0], reverse=True)
-            tier_specs = [
+            # Use the SAME tier specs the pre-batch phase used (order matters:
+            # backing units are matched to tiers by position).
+            tier_specs = pre_specs.get(ad_unit_id) or [
                 (f"{ad_unit_name}_tier{i}_${ec:.2f}".replace(" ", "_")[:80], ec)
                 for i, ec in enumerate(sorted_ecpms, start=1)
             ]
-            _log(f"  batchCreate {len(tier_specs)} AdMob Network Waterfall "
-                 f"backing ad unit(s) [v1alpha]")
-            try:
-                backing_units = _timed(
-                    "batch_create_waterfall_ad_units",
-                    lambda: client.batch_create_waterfall_ad_units(
-                        app_id=app_row.app_id,
-                        primary_ad_unit_id=ad_unit_id,
-                        ad_format=ad_format,
-                        tiers=tier_specs,
-                    ),
-                )
-            except AdMobAPIError as e:
-                _log(f"  batch_create_waterfall_ad_units FAILED: {e}")
-                push_errors.append({
-                    "ad_unit_id": ad_unit_id, "tier": "",
-                    "stage": "batch_create_waterfall_ad_units",
-                    "error": str(e),
-                })
-                backing_units = []
+            if ad_unit_id in pre_tier_units:
+                # Already created up-front in the multi-group batch.
+                backing_units = pre_tier_units[ad_unit_id]
+                _log(f"  using {len(backing_units)} pre-batched tier ad "
+                     f"unit(s)")
+            else:
+                _log(f"  batchCreate {len(tier_specs)} AdMob Network Waterfall "
+                     f"backing ad unit(s) [v1alpha]")
+                try:
+                    backing_units = _timed(
+                        "batch_create_waterfall_ad_units",
+                        lambda: client.batch_create_waterfall_ad_units(
+                            app_id=app_row.app_id,
+                            primary_ad_unit_id=ad_unit_id,
+                            ad_format=ad_format,
+                            tiers=tier_specs,
+                        ),
+                    )
+                except AdMobAPIError as e:
+                    _log(f"  batch_create_waterfall_ad_units FAILED: {e}")
+                    push_errors.append({
+                        "ad_unit_id": ad_unit_id, "tier": "",
+                        "stage": "batch_create_waterfall_ad_units",
+                        "error": str(e),
+                    })
+                    backing_units = []
 
             # Step 2 — build N MANUAL "AdMob Network Waterfall" lines, each
             # referencing its tier's auto-created mapping.
@@ -5535,27 +5781,34 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
                         _log(f"    {cat['name']}: no field values saved — "
                              f"skipped")
                         continue
-                    dn = (f"{cat['name']} bidding "
-                          f"{ad_unit_id.split('/')[-1][-6:]}")[:80]
-                    try:
-                        mp_resp, _warns = client.create_ad_unit_mapping_in_admob(
-                            ad_unit_id=ad_unit_id,
-                            network_code=brow.network_code,
-                            platform=app_row.platform,
-                            display_name=dn,
-                            user_fields=fields,
-                            ad_format=ad_format,
-                            for_bidding=True,
-                        )
-                    except AdMobAPIError as e:
-                        _log(f"    {cat['name']}: mapping create FAILED: {e}")
-                        push_errors.append({
-                            "ad_unit_id": ad_unit_id, "tier": "",
-                            "stage": (f"create_bidding_mapping("
-                                      f"{brow.network_code})"),
-                            "error": str(e),
-                        })
-                        continue
+                    pre_name = pre_bid_mappings.get(
+                        (ad_unit_id, brow.network_code))
+                    if pre_name:
+                        # Mapping was already created in the pre-batch phase.
+                        mp_resp = {"name": pre_name}
+                        _log(f"    {cat['name']}: using pre-batched mapping")
+                    else:
+                        dn = (f"{cat['name']} bidding "
+                              f"{ad_unit_id.split('/')[-1][-6:]}")[:80]
+                        try:
+                            mp_resp, _warns = client.create_ad_unit_mapping_in_admob(
+                                ad_unit_id=ad_unit_id,
+                                network_code=brow.network_code,
+                                platform=app_row.platform,
+                                display_name=dn,
+                                user_fields=fields,
+                                ad_format=ad_format,
+                                for_bidding=True,
+                            )
+                        except AdMobAPIError as e:
+                            _log(f"    {cat['name']}: mapping create FAILED: {e}")
+                            push_errors.append({
+                                "ad_unit_id": ad_unit_id, "tier": "",
+                                "stage": (f"create_bidding_mapping("
+                                          f"{brow.network_code})"),
+                                "error": str(e),
+                            })
+                            continue
                     mapping_name = (mp_resp or {}).get("name", "") or ""
                     # CRITICAL: use the BIDDING source id (not waterfall) for
                     # the LIVE bidding line. AdMob has a separate "(bidding)"
