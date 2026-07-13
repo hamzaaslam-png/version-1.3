@@ -424,8 +424,11 @@ $("#fetch-report-btn").addEventListener("click", async () => {
       ? `Geo: ${data.countries.join(", ")}` : "Geo: Global (all countries)";
     const src = (data.report_type === "network")
       ? "Source: Network (AdMob Network)" : "Source: Mediation (Observed eCPM)";
-    const anyCur = (Object.values(state.report)[0] || {}).currency;
-    const curNote = anyCur && anyCur !== "USD" ? ` · Currency: ${anyCur} (your AdMob account currency — used for waterfall floors)` : "";
+    const first = Object.values(state.report)[0] || {};
+    const anyCur = first.currency, anyFx = first.fx;
+    const curNote = (anyCur && anyCur !== "USD")
+      ? ` · Values shown in USD; floors pushed in ${anyCur} (×${(anyFx||1).toFixed(4)}) — your AdMob account currency`
+      : "";
     $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo} · ${src}${curNote}`;
     renderReport();
     $("#report-section").style.display = "";
@@ -483,15 +486,15 @@ function renderReport() {
     card.innerHTML = `
       <div class="report-card-head">
         <div><div class="report-card-title">${u.name || "(unnamed)"}</div><div class="mono small muted">${u.ad_unit_id} · ${u.ad_format}</div></div>
-        <div class="report-card-summary">Avg eCPM <b>${fmtMoney(ecpm, cur)}</b> · Revenue <b>${fmtMoney(m.revenue_usd, cur)}</b></div>
+        <div class="report-card-summary">Avg eCPM <b>${fmtMoney(ecpm, "USD")}</b> · Revenue <b>${fmtMoney(m.revenue_usd, "USD")}</b></div>
       </div>
       <div class="metric-grid">
-        <div class="metric"><span class="metric-label">Avg eCPM</span><span class="metric-value">${fmtMoney(ecpm, cur)}</span></div>
-        <div class="metric"><span class="metric-label">Revenue</span><span class="metric-value good">${fmtMoney(m.revenue_usd, cur)}</span></div>
+        <div class="metric"><span class="metric-label">Avg eCPM</span><span class="metric-value">${fmtMoney(ecpm, "USD")}</span></div>
+        <div class="metric"><span class="metric-label">Revenue</span><span class="metric-value good">${fmtMoney(m.revenue_usd, "USD")}</span></div>
         <div class="metric"><span class="metric-label">Match Rate</span><span class="metric-value">${fmtPct(m.match_rate || 0)}</span></div>
         <div class="metric"><span class="metric-label">Show Rate</span><span class="metric-value">${fmtPct(m.show_rate || 0)}</span></div>
         <div class="metric"><span class="metric-label">Fill Rate</span><span class="metric-value">${fmtPct(m.fill_rate || 0)}</span></div>
-        <div class="metric"><span class="metric-label">RPM</span><span class="metric-value">${fmtMoney(m.rpm_usd, cur)}</span></div>
+        <div class="metric"><span class="metric-label">RPM</span><span class="metric-value">${fmtMoney(m.rpm_usd, "USD")}</span></div>
         <div class="metric"><span class="metric-label">Requests</span><span class="metric-value">${(m.ad_requests||0).toLocaleString()}</span></div>
         <div class="metric"><span class="metric-label">Impressions</span><span class="metric-value">${(m.impressions||0).toLocaleString()}</span></div>
       </div>

@@ -993,6 +993,51 @@ class AdMobClient:
         self._account_currency = cur
         return cur
 
+    def get_usd_to_account_fx(self) -> float:
+        """Multiplier to turn a USD amount into the ACCOUNT currency — used at
+        push time to convert USD tier eCPMs into the currency AdMob stores
+        waterfall floors in. 1.0 for USD accounts. Derived from AdMob itself
+        (account-total earnings in native ÷ in USD over 30 days) so there is no
+        hardcoded FX table; cached per client."""
+        cur = self.get_account_currency()
+        if cur == "USD":
+            return 1.0
+        if getattr(self, "_usd_fx", None):
+            return self._usd_fx
+        fx = 1.0
+        try:
+            parent = f"accounts/{self.get_publisher_id()}"
+            start, end = _days_ago_iso(30), _days_ago_iso(1)
+
+            def _total(ccy: str) -> float:
+                body = {"reportSpec": {
+                    "dateRange": {"startDate": _date_parts(start),
+                                  "endDate": _date_parts(end)},
+                    "metrics": ["ESTIMATED_EARNINGS"],
+                    "localizationSettings": {"currencyCode": ccy}}}
+                resp = self._with_quota_retry(
+                    lambda: self.service.accounts().mediationReport()
+                    .generate(parent=parent, body=body).execute())
+                tot = 0
+                for e in (resp if isinstance(resp, list) else []):
+                    r = e.get("row")
+                    if not r:
+                        continue
+                    mv = (r.get("metricValues", {})
+                          .get("ESTIMATED_EARNINGS", {}))
+                    tot += int(mv.get("microsValue", 0) or 0)
+                return tot / 1_000_000.0
+            usd, nat = _total("USD"), _total(cur)
+            if usd > 0 and nat > 0:
+                fx = nat / usd
+        except Exception:
+            fx = 1.0
+        # Guard against a nonsense ratio (e.g. empty report) — fall back to 1.0.
+        if not (0.01 < fx < 10000):
+            fx = 1.0
+        self._usd_fx = fx
+        return fx
+
     def list_apps(self) -> list[dict]:
         parent = f"accounts/{self.get_publisher_id()}"
         return self._with_quota_retry(
@@ -1021,6 +1066,9 @@ class AdMobClient:
         use_mediation = (report_type or "mediation").lower() != "network"
         parent = f"accounts/{self.get_publisher_id()}"
         account_currency = self.get_account_currency()
+        # USD -> account-currency multiplier for converting displayed USD eCPMs
+        # into the floor currency at push time (1.0 for USD accounts).
+        usd_fx = self.get_usd_to_account_fx()
         dimension_filters = [
             {"dimension": "AD_UNIT", "matchesAny": {"values": ad_unit_ids}}
         ]
@@ -1050,13 +1098,12 @@ class AdMobClient:
                 "dimensions": ["AD_UNIT"],
                 "dimensionFilters": dimension_filters,
                 "metrics": metrics,
-                # Request the report in the ACCOUNT's own currency. This is the
-                # currency AdMob uses for mediation/waterfall CPM floors (those
-                # fields carry no currencyCode), so the eCPM we read here is on
-                # the exact same scale as the floors we later push — no FX
-                # mismatch. Pinning it explicitly (instead of relying on the
-                # API default) also protects against the default ever changing.
-                "localizationSettings": {"currencyCode": account_currency},
+                # DISPLAY values are requested in USD so they match the AdMob
+                # reporting UI the user compares against. The waterfall FLOORS,
+                # however, must be pushed in the account currency (AdMob stores
+                # them there, no currencyCode field) — the push step converts
+                # each USD tier eCPM using `fx` below. So: show USD, push native.
+                "localizationSettings": {"currencyCode": "USD"},
             }
         }
         report_res = (self.service.accounts().mediationReport()
@@ -1125,9 +1172,10 @@ class AdMobClient:
                 "rpm_usd": round(rpm_usd, 2), "match_rate": round(match_rate, 4),
                 "show_rate": round(show_rate, 4), "fill_rate": round(fill_rate, 4),
                 "ctr": round(ctr, 4),
-                # The currency ALL money fields above are in (= the account
-                # currency, which is also the waterfall-floor currency).
-                "currency": account_currency,
+                # Money fields above are USD (display). The waterfall floors are
+                # pushed in `account_currency`; multiply a USD eCPM by `fx` to
+                # get the floor value. (fx = 1.0 for USD accounts.)
+                "currency": account_currency, "fx": round(usd_fx, 6),
             }
         return out
 
@@ -3214,8 +3262,11 @@ $("#fetch-report-btn").addEventListener("click", async () => {
       ? `Geo: ${data.countries.join(", ")}` : "Geo: Global (all countries)";
     const src = (data.report_type === "network")
       ? "Source: Network (AdMob Network)" : "Source: Mediation (Observed eCPM)";
-    const anyCur = (Object.values(state.report)[0] || {}).currency;
-    const curNote = anyCur && anyCur !== "USD" ? ` · Currency: ${anyCur} (your AdMob account currency — used for waterfall floors)` : "";
+    const first = Object.values(state.report)[0] || {};
+    const anyCur = first.currency, anyFx = first.fx;
+    const curNote = (anyCur && anyCur !== "USD")
+      ? ` · Values shown in USD; floors pushed in ${anyCur} (×${(anyFx||1).toFixed(4)}) — your AdMob account currency`
+      : "";
     $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo} · ${src}${curNote}`;
     renderReport();
     $("#report-section").style.display = "";
@@ -3273,15 +3324,15 @@ function renderReport() {
     card.innerHTML = `
       <div class="report-card-head">
         <div><div class="report-card-title">${u.name || "(unnamed)"}</div><div class="mono small muted">${u.ad_unit_id} · ${u.ad_format}</div></div>
-        <div class="report-card-summary">Avg eCPM <b>${fmtMoney(ecpm, cur)}</b> · Revenue <b>${fmtMoney(m.revenue_usd, cur)}</b></div>
+        <div class="report-card-summary">Avg eCPM <b>${fmtMoney(ecpm, "USD")}</b> · Revenue <b>${fmtMoney(m.revenue_usd, "USD")}</b></div>
       </div>
       <div class="metric-grid">
-        <div class="metric"><span class="metric-label">Avg eCPM</span><span class="metric-value">${fmtMoney(ecpm, cur)}</span></div>
-        <div class="metric"><span class="metric-label">Revenue</span><span class="metric-value good">${fmtMoney(m.revenue_usd, cur)}</span></div>
+        <div class="metric"><span class="metric-label">Avg eCPM</span><span class="metric-value">${fmtMoney(ecpm, "USD")}</span></div>
+        <div class="metric"><span class="metric-label">Revenue</span><span class="metric-value good">${fmtMoney(m.revenue_usd, "USD")}</span></div>
         <div class="metric"><span class="metric-label">Match Rate</span><span class="metric-value">${fmtPct(m.match_rate || 0)}</span></div>
         <div class="metric"><span class="metric-label">Show Rate</span><span class="metric-value">${fmtPct(m.show_rate || 0)}</span></div>
         <div class="metric"><span class="metric-label">Fill Rate</span><span class="metric-value">${fmtPct(m.fill_rate || 0)}</span></div>
-        <div class="metric"><span class="metric-label">RPM</span><span class="metric-value">${fmtMoney(m.rpm_usd, cur)}</span></div>
+        <div class="metric"><span class="metric-label">RPM</span><span class="metric-value">${fmtMoney(m.rpm_usd, "USD")}</span></div>
         <div class="metric"><span class="metric-label">Requests</span><span class="metric-value">${(m.ad_requests||0).toLocaleString()}</span></div>
         <div class="metric"><span class="metric-label">Impressions</span><span class="metric-value">${(m.impressions||0).toLocaleString()}</span></div>
       </div>
@@ -4781,8 +4832,26 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.3.4"
 CHANGELOG = [
+    {
+        "version": "1.3.4",
+        "date": "2026-07-13",
+        "title": "Show USD, push in account currency — best of both",
+        "changes": [
+            "Reports now show eCPM/revenue in USD (matching the AdMob dashboard "
+            "you compare against), while the waterfall floors are pushed in your "
+            "AdMob ACCOUNT currency (e.g. AED) — the currency AdMob actually "
+            "stores floors in. So the numbers you see match AdMob, and the floors "
+            "that get created are correct.",
+            "Each displayed USD eCPM is converted to the account currency at push "
+            "time using an exchange rate read from AdMob itself (no hardcoded "
+            "rates) — e.g. $0.94 shown becomes a 3.45 AED floor. USD accounts are "
+            "unaffected (rate = 1.0).",
+            "The report header shows the conversion (e.g. 'floors pushed in AED "
+            "×3.6730') so it is always clear what will be created.",
+        ],
+    },
     {
         "version": "1.3.3",
         "date": "2026-07-13",
@@ -6138,8 +6207,17 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
     if push_to_admob:
         _log("Initializing AdMob client (OAuth refresh if needed) ...")
     client = AdMobClient(db, user) if push_to_admob else None
-    if push_to_admob:
+    # USD -> account-currency multiplier for the pushed floors. The report/UI
+    # shows USD (matches the AdMob reporting view), but AdMob stores waterfall
+    # floors in the account currency, so every tier eCPM is converted by this
+    # factor before it becomes a floor / line CPM. 1.0 for USD accounts.
+    floor_fx = 1.0
+    if push_to_admob and client is not None:
         _log("AdMob client ready.")
+        floor_fx = client.get_usd_to_account_fx()
+        if floor_fx != 1.0:
+            _log(f"  floor currency: {client.get_account_currency()} "
+                 f"(USD x {floor_fx:.4f}) — tier eCPMs converted before push")
     created: list[dict] = []
     push_errors: list[dict] = []
     push_countries = countries if country_mode == "INCLUDE" else []
@@ -6160,7 +6238,9 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
         valid = []
         for it in items:
             au = str(it.get("ad_unit_id") or "")
-            ecs = [min(WATERFALL_MAX_ECPM, max(WATERFALL_MIN_ECPM, float(x)))
+            # Clamp in USD (the range the user set), then convert to the
+            # account currency for the actual floor value.
+            ecs = [round(min(WATERFALL_MAX_ECPM, max(WATERFALL_MIN_ECPM, float(x))) * floor_fx, 4)
                    for x in (it.get("lines") or []) if float(x) > 0]
             if au and ecs:
                 nm = str(it.get("ad_unit_name") or au)
@@ -6258,10 +6338,12 @@ def _generate_groups(payload: dict, db: Session, user: User, push_to_admob: bool
         ad_unit_name = str(item.get("ad_unit_name") or ad_unit_id)
         ad_format = str(item.get("ad_format") or "BANNER")
         metrics = item.get("metrics") or {}
-        # Server-side clamp — even if the UI sends out-of-range tier eCPMs,
-        # AdMob rejects values outside [WATERFALL_MIN_ECPM, WATERFALL_MAX_ECPM].
+        # Server-side clamp (in USD, the range the user set) — even if the UI
+        # sends out-of-range tier eCPMs, AdMob rejects values outside
+        # [WATERFALL_MIN_ECPM, WATERFALL_MAX_ECPM]. Then convert to the account
+        # currency (floor_fx) — AdMob stores floors in the account currency.
         ecpms = [
-            min(WATERFALL_MAX_ECPM, max(WATERFALL_MIN_ECPM, float(x)))
+            round(min(WATERFALL_MAX_ECPM, max(WATERFALL_MIN_ECPM, float(x))) * floor_fx, 4)
             for x in (item.get("lines") or []) if float(x) > 0
         ]
         if not ecpms:
