@@ -970,6 +970,29 @@ class AdMobClient:
         self._publisher_id = pub_id
         return pub_id
 
+    def get_account_currency(self) -> str:
+        """The AdMob account's currency (e.g. 'USD', 'AED').
+
+        CRITICAL for the waterfall: AdMob stores mediation/waterfall CPM floors
+        in the ACCOUNT's currency — the floor fields have NO currencyCode. So
+        the report we build the waterfall from MUST be requested in this same
+        currency, otherwise the pushed floors are numerically right but in the
+        wrong currency (e.g. USD values landing in an AED account = ~3.67x off).
+        Read from the PublisherAccount we already fetched; defaults to USD."""
+        if getattr(self, "_account_currency", None):
+            return self._account_currency
+        cur = "USD"
+        try:
+            pub = self.get_publisher_id()
+            for a in (self.list_accounts() or []):
+                if a.get("publisherId") == pub and a.get("currencyCode"):
+                    cur = a["currencyCode"].upper()
+                    break
+        except Exception:
+            cur = "USD"
+        self._account_currency = cur
+        return cur
+
     def list_apps(self) -> list[dict]:
         parent = f"accounts/{self.get_publisher_id()}"
         return self._with_quota_retry(
@@ -997,6 +1020,7 @@ class AdMobClient:
             return {}
         use_mediation = (report_type or "mediation").lower() != "network"
         parent = f"accounts/{self.get_publisher_id()}"
+        account_currency = self.get_account_currency()
         dimension_filters = [
             {"dimension": "AD_UNIT", "matchesAny": {"values": ad_unit_ids}}
         ]
@@ -1026,13 +1050,13 @@ class AdMobClient:
                 "dimensions": ["AD_UNIT"],
                 "dimensionFilters": dimension_filters,
                 "metrics": metrics,
-                # CRITICAL: force USD. Without this the AdMob reporting API
-                # returns money (ESTIMATED_EARNINGS, OBSERVED_ECPM) in the
-                # ACCOUNT's local currency (e.g. AED), which the code then
-                # reads as if it were USD — inflating every eCPM/revenue by the
-                # FX rate (AED = 3.6725, so ~3.67x too high). Requesting USD
-                # makes the numbers match the AdMob UI exactly.
-                "localizationSettings": {"currencyCode": "USD"},
+                # Request the report in the ACCOUNT's own currency. This is the
+                # currency AdMob uses for mediation/waterfall CPM floors (those
+                # fields carry no currencyCode), so the eCPM we read here is on
+                # the exact same scale as the floors we later push — no FX
+                # mismatch. Pinning it explicitly (instead of relying on the
+                # API default) also protects against the default ever changing.
+                "localizationSettings": {"currencyCode": account_currency},
             }
         }
         report_res = (self.service.accounts().mediationReport()
@@ -1101,6 +1125,9 @@ class AdMobClient:
                 "rpm_usd": round(rpm_usd, 2), "match_rate": round(match_rate, 4),
                 "show_rate": round(show_rate, 4), "fill_rate": round(fill_rate, 4),
                 "ctr": round(ctr, 4),
+                # The currency ALL money fields above are in (= the account
+                # currency, which is also the waterfall-floor currency).
+                "currency": account_currency,
             }
         return out
 
@@ -3187,7 +3214,9 @@ $("#fetch-report-btn").addEventListener("click", async () => {
       ? `Geo: ${data.countries.join(", ")}` : "Geo: Global (all countries)";
     const src = (data.report_type === "network")
       ? "Source: Network (AdMob Network)" : "Source: Mediation (Observed eCPM)";
-    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo} · ${src}`;
+    const anyCur = (Object.values(state.report)[0] || {}).currency;
+    const curNote = anyCur && anyCur !== "USD" ? ` · Currency: ${anyCur} (your AdMob account currency — used for waterfall floors)` : "";
+    $("#report-date-range").textContent = `Date range: ${data.start} → ${data.end} (last 7 days) · ${geo} · ${src}${curNote}`;
     renderReport();
     $("#report-section").style.display = "";
     $("#report-section").scrollIntoView({ behavior: "smooth", block: "start" });
@@ -3199,7 +3228,14 @@ $("#fetch-report-btn").addEventListener("click", async () => {
 });
 
 function fmtPct(n) { return (n * 100).toFixed(2) + "%"; }
-function fmtUSD(n) { return "$" + (n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+// Money is shown in the AdMob ACCOUNT currency (same currency the waterfall
+// floors use). USD -> "$1.23"; anything else -> "AED 1.23".
+function fmtMoney(n, cur) {
+  cur = cur || "USD";
+  const v = (n || 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return cur === "USD" ? "$" + v : cur + " " + v;
+}
+function fmtUSD(n) { return fmtMoney(n, "USD"); }
 const TIER_MULTIPLIERS = {{ tier_multipliers|tojson }};
 const MIN_ECPM = {{ min_ecpm }};
 const MAX_ECPM = {{ max_ecpm }};
@@ -3227,6 +3263,7 @@ function renderReport() {
   state.ad_units.forEach(u => {
     const m = (state.report || {})[u.ad_unit_id] || {};
     const ecpm = m.ecpm_usd || 0;
+    const cur = m.currency || "USD";
     const lines = computeLines(ecpm, state.line_count);
 
     const card = document.createElement("div");
@@ -3236,15 +3273,15 @@ function renderReport() {
     card.innerHTML = `
       <div class="report-card-head">
         <div><div class="report-card-title">${u.name || "(unnamed)"}</div><div class="mono small muted">${u.ad_unit_id} · ${u.ad_format}</div></div>
-        <div class="report-card-summary">Avg eCPM <b>${fmtUSD(ecpm)}</b> · Revenue <b>${fmtUSD(m.revenue_usd)}</b></div>
+        <div class="report-card-summary">Avg eCPM <b>${fmtMoney(ecpm, cur)}</b> · Revenue <b>${fmtMoney(m.revenue_usd, cur)}</b></div>
       </div>
       <div class="metric-grid">
-        <div class="metric"><span class="metric-label">Avg eCPM</span><span class="metric-value">${fmtUSD(ecpm)}</span></div>
-        <div class="metric"><span class="metric-label">Revenue</span><span class="metric-value good">${fmtUSD(m.revenue_usd)}</span></div>
+        <div class="metric"><span class="metric-label">Avg eCPM</span><span class="metric-value">${fmtMoney(ecpm, cur)}</span></div>
+        <div class="metric"><span class="metric-label">Revenue</span><span class="metric-value good">${fmtMoney(m.revenue_usd, cur)}</span></div>
         <div class="metric"><span class="metric-label">Match Rate</span><span class="metric-value">${fmtPct(m.match_rate || 0)}</span></div>
         <div class="metric"><span class="metric-label">Show Rate</span><span class="metric-value">${fmtPct(m.show_rate || 0)}</span></div>
         <div class="metric"><span class="metric-label">Fill Rate</span><span class="metric-value">${fmtPct(m.fill_rate || 0)}</span></div>
-        <div class="metric"><span class="metric-label">RPM</span><span class="metric-value">${fmtUSD(m.rpm_usd)}</span></div>
+        <div class="metric"><span class="metric-label">RPM</span><span class="metric-value">${fmtMoney(m.rpm_usd, cur)}</span></div>
         <div class="metric"><span class="metric-label">Requests</span><span class="metric-value">${(m.ad_requests||0).toLocaleString()}</span></div>
         <div class="metric"><span class="metric-label">Impressions</span><span class="metric-value">${(m.impressions||0).toLocaleString()}</span></div>
       </div>
@@ -4744,8 +4781,30 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 CHANGELOG = [
+    {
+        "version": "1.3.3",
+        "date": "2026-07-13",
+        "title": "Correct currency — waterfall floors match your AdMob account",
+        "changes": [
+            "IMPORTANT correctness fix for the waterfall. AdMob stores mediation / "
+            "waterfall CPM floors in your ACCOUNT's currency (here AED) — those "
+            "fields have no currency setting. The report is now read in that same "
+            "account currency, so the eCPM used to build the waterfall is on the "
+            "exact same scale as the floors AdMob stores. This prevents floors "
+            "from being pushed in the wrong currency (which would misprice every "
+            "tier by the exchange rate and hurt fill/revenue).",
+            "eCPM, revenue and RPM are now labelled with your account currency "
+            "(e.g. 'AED 3.44'). That is the same value as $0.94 USD — just shown "
+            "in the currency AdMob actually uses for mediation. Tier floors you "
+            "see are exactly what gets pushed (no hidden conversion).",
+            "The v1.3.2 change (forcing USD) matched the USD reporting view but "
+            "would have made the pushed floors ~3.67x too low in an AED account — "
+            "this release supersedes it with the account-currency approach, which "
+            "matches the floors AdMob really uses and works for any region.",
+        ],
+    },
     {
         "version": "1.3.2",
         "date": "2026-07-13",
