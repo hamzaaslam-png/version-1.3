@@ -4,7 +4,7 @@
 <section class="page-head">
   <p class="eyebrow">Bidding setup</p>
   <h1 class="display">3rd-party bidding networks</h1>
-  <p class="lede">For each <b>app</b> + <b>network</b> + <b>ad format</b>, you fill the mapping <b>once</b> and pick which ad unit it applies to. Each (network, format) → one mapping. When the builder's "Include All Bidding Networks" is on AND the pushed source ad unit matches this mapping's ad unit, it becomes a LIVE bidding line on the mediation group.</p>
+  <p class="lede">Set up each bidding network once per app and ad format. The Builder then adds them to your mediation groups automatically.</p>
 </section>
 
 {% if not apps %}
@@ -43,8 +43,8 @@
     <!-- AUTO-CHECK: existing mediation groups for this app, per format -->
     <section class="bid-existing-card">
       <header class="bid-existing-head">
-        <h3>Existing Mediation Groups</h3>
-        <p class="muted small" style="margin:4px 0 0">Auto-fetched from your AdMob account for this app. "Mediation group not found" = nothing exists yet for that format, push will create new.</p>
+        <h3>Existing mediation groups</h3>
+        <p class="muted small" style="margin:4px 0 0">What's already set up in AdMob for this app. "Not found" just means Flow will create a new one when you push.</p>
       </header>
       <div class="bid-existing-grid" data-app="{{ a.id }}">
         <div class="bid-existing-loading muted small">Loading from AdMob…</div>
@@ -54,8 +54,8 @@
     <!-- STEP 1: Format Support Summary -->
     <section class="bid-step-card">
       <header class="bid-step-head">
-        <h3>Step 1: Format Support Summary</h3>
-        <p class="muted small">Select which ad sources you want to enable for each ad format. Tap a chip to toggle.</p>
+        <h3>Step 1 · Choose networks</h3>
+        <p class="muted small">Tap a network to turn it on for that ad format.</p>
       </header>
 
       {% for fmt in formats %}
@@ -88,8 +88,8 @@
     <!-- STEP 2: Configure Ad Units -->
     <section class="bid-step-card">
       <header class="bid-step-head">
-        <h3>Step 2: Configure Ad Units</h3>
-        <p class="muted small">Enter the required configuration values for selected ad sources. Each (network × format) is one mapping — pick the ad unit it applies to and fill the network's values.</p>
+        <h3>Step 2 · Enter each network's details</h3>
+        <p class="muted small">Fill in the keys and IDs for the networks you turned on, and pick the ad unit each one applies to.</p>
       </header>
 
       {% for fmt in formats %}
@@ -160,10 +160,10 @@
     <section class="bid-step-card bid-preview-card">
       <header class="bid-preview-head">
         <div>
-          <h3>JSON Preview</h3>
-          <p class="muted small" style="margin:4px 0 0">Review the configuration before saving</p>
+          <h3>Preview</h3>
+          <p class="muted small" style="margin:4px 0 0">See exactly what will be saved.</p>
         </div>
-        <button type="button" class="btn-secondary btn-sm bid-preview-toggle">Show Preview</button>
+        <button type="button" class="btn-secondary btn-sm bid-preview-toggle">Show preview</button>
       </header>
       <pre class="bid-preview-json" style="display:none"></pre>
     </section>
@@ -172,10 +172,10 @@
     <section class="bid-confirm-card">
       <label class="bid-confirm">
         <input type="checkbox" class="bid-confirm-cb" />
-        <span><strong>I confirm</strong> this configuration will be saved. Please review the configuration above before proceeding.</span>
+        <span>I've reviewed the details above and I'm ready to save.</span>
       </label>
       <button type="button" class="btn-primary btn-lg bid-save-all" disabled>
-        💾  Save Bidding Configurations
+        💾  Save
       </button>
       <div class="bid-save-result muted small"></div>
     </section>

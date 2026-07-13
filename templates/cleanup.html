@@ -4,7 +4,7 @@
 <section class="page-head">
   <p class="eyebrow">Cleanup</p>
   <h1 class="display">Delete ad units &amp; mediation groups</h1>
-  <p class="lede">Pick an app, review what exists in your AdMob account — loaded instantly from the last sync, no API wait — then select all or specific items and delete.</p>
+  <p class="lede">Pick an app to see everything in it, then delete the ad units or groups you no longer need.</p>
 </section>
 
 {% if not apps %}
@@ -12,7 +12,7 @@
   <form method="post" action="/apps/sync" style="display:inline"><button class="btn-primary" type="submit">↻ Sync from AdMob</button></form></p></div>
 {% else %}
 <div class="alert alert-warn" style="margin-bottom:20px">
-  <strong>Before you delete:</strong> Ad units are <strong>permanently removed</strong> from AdMob (along with their waterfall &amp; bidding mappings). Mediation groups have no hard-delete in the AdMob API — selected groups are <strong>disabled</strong> (they stop serving and can be re-enabled later).
+  <strong>Before you delete:</strong> Ad units are <strong>permanently removed</strong> from AdMob. Mediation groups can't be deleted through AdMob, so Flow <strong>disables</strong> them instead — they stop serving and you can turn them back on later.
 </div>
 
 <section class="card" style="margin-bottom:18px">

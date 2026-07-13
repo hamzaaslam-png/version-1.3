@@ -2252,9 +2252,17 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}Flow{% endblock %}</title>
+  <meta name="color-scheme" content="light dark">
+  <script>
+    // Set theme before first paint to avoid a flash. Default = light.
+    (function(){ try {
+      var t = localStorage.getItem("flow-theme") || "light";
+      document.documentElement.setAttribute("data-theme", t);
+    } catch(e){ document.documentElement.setAttribute("data-theme","light"); } })();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -2273,10 +2281,60 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
         <span class="user-chip">{% if user.picture %}<img src="{{ user.picture }}" alt="" />{% endif %}<span>{{ user.email }}</span></span>
         <a href="/auth/logout" class="logout">Sign out</a>
       {% endif %}
+      <button type="button" class="theme-toggle" id="theme-toggle" title="Toggle light / dark" aria-label="Toggle light or dark theme"><span class="icon-light">🌙</span><span class="icon-dark">☀️</span></button>
     </nav>
   </header>
   <main class="content">{% block content %}{% endblock %}</main>
-  <footer class="footer"><span>Flow</span><span class="footer-sep">·</span><a href="/changelog" class="footer-version" title="What's new — click for the changelog">v{{ app_version }}</a><span class="footer-sep">·</span><span>1 group per source · Tier ad units · Replicated bidding mappings · Live audit</span></footer>
+  <footer class="footer"><span>Flow</span><span class="footer-sep">·</span><a href="/changelog" class="footer-version" title="What's new — click for the changelog">v{{ app_version }}</a><span class="footer-sep">·</span><span>Build AdMob mediation waterfalls in a few clicks.</span></footer>
+  <script>
+    // ---- Theme toggle (persisted) ----
+    (function(){
+      var btn = document.getElementById("theme-toggle");
+      if (!btn) return;
+      btn.addEventListener("click", function(){
+        var cur = document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+        var next = cur === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        try { localStorage.setItem("flow-theme", next); } catch(e){}
+      });
+    })();
+    // ---- M3 dialog helper: window.m3confirm(opts) -> Promise<bool> ----
+    // Clean replacement for native confirm()/alert(). Usage:
+    //   m3confirm({title, message, confirmText, danger}).then(ok => { ... })
+    window.m3confirm = function(opts){
+      opts = opts || {};
+      return new Promise(function(resolve){
+        var scrim = document.createElement("div");
+        scrim.className = "m3-scrim";
+        var confirmText = opts.confirmText || "Confirm";
+        var cancelText = opts.cancelText || "Cancel";
+        var confirmCls = opts.danger ? "btn-danger" : "btn-primary";
+        var d = document.createElement("div");
+        d.className = "m3-dialog";
+        d.setAttribute("role","dialog"); d.setAttribute("aria-modal","true");
+        var h = document.createElement("h3"); h.textContent = opts.title || "Are you sure?";
+        var p = document.createElement("p"); p.textContent = opts.message || "";
+        var acts = document.createElement("div"); acts.className = "m3-dialog-actions";
+        d.appendChild(h); if (opts.message) d.appendChild(p); d.appendChild(acts);
+        function close(val){ scrim.classList.remove("show"); setTimeout(function(){ scrim.remove(); }, 200); resolve(val); }
+        if (!opts.alert){
+          var cancel = document.createElement("button");
+          cancel.type = "button"; cancel.className = "btn-ghost"; cancel.textContent = cancelText;
+          cancel.addEventListener("click", function(){ close(false); });
+          acts.appendChild(cancel);
+        }
+        var ok = document.createElement("button");
+        ok.type = "button"; ok.className = confirmCls; ok.textContent = opts.alert ? (opts.confirmText || "OK") : confirmText;
+        ok.addEventListener("click", function(){ close(true); });
+        acts.appendChild(ok);
+        scrim.appendChild(d); document.body.appendChild(scrim);
+        scrim.addEventListener("click", function(e){ if (e.target === scrim && !opts.alert) close(false); });
+        requestAnimationFrame(function(){ scrim.classList.add("show"); ok.focus(); });
+      });
+    };
+    // Convenience alert-style toast/dialog
+    window.m3alert = function(message, title){ return window.m3confirm({title: title || "Notice", message: message, alert: true, confirmText: "OK"}); };
+  </script>
 </body>
 </html>"""
 
@@ -2285,22 +2343,22 @@ TEMPLATE_FILES["login.html"] = r"""{% extends "base.html" %}
 {% block content %}
 <section class="login-wrap">
   <div class="login-card">
-    <p class="eyebrow">AdMob mediation workflow</p>
+    <p class="eyebrow">AdMob mediation, made simple</p>
     <h1 class="display">Connect your <em>AdMob</em> account.</h1>
-    <p class="lede">Sign in with Google. The tool pulls your AdMob apps, ad units, and last-7-day metrics live from the AdMob API, then helps you build mediation waterfalls — one mediation group per source ad unit, with N labeled tier ad units as lines.</p>
-    <a class="btn-primary" href="/auth/login"><span class="g-mark">G</span>Continue with Google</a>
-    <p class="fineprint">Requires AdMob API scopes: <code>admob.readonly</code>, <code>admob.report</code>, <code>admob.monetization</code>.</p>
+    <p class="lede">Sign in with Google and Flow loads your apps, ad units, and last-7-day earnings. Then it builds your mediation waterfalls for you — no manual setup in AdMob.</p>
+    <a class="btn-primary" href="/auth/login"><span class="g-mark"><svg viewBox="0 0 48 48" width="18" height="18" aria-hidden="true" focusable="false"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg></span>Continue with Google</a>
+    <p class="fineprint">Flow only asks for the AdMob permissions it needs to read your reports and set up mediation. Your credentials stay encrypted.</p>
   </div>
   <aside class="login-side">
-    <h3>Workflow</h3>
+    <h3>How it works</h3>
     <ol>
-      <li>Sign in with Google (OAuth)</li>
-      <li>Sync your AdMob apps + ad units</li>
-      <li>Open the Builder, pick app + ad units</li>
-      <li>Choose country targeting + waterfall depth</li>
-      <li>Fetch live AdMob report (7 days)</li>
-      <li>Tool calculates waterfall eCPM values</li>
-      <li>Push: tier ad units + 1 mediation group with N waterfall lines</li>
+      <li>Sign in with Google</li>
+      <li>Sync your apps &amp; ad units</li>
+      <li>Pick an app and its ad units</li>
+      <li>Choose countries &amp; waterfall depth</li>
+      <li>Fetch live earnings (last 7 days)</li>
+      <li>Flow calculates the waterfall for you</li>
+      <li>One click builds it all in AdMob</li>
     </ol>
   </aside>
 </section>
@@ -2311,22 +2369,34 @@ TEMPLATE_FILES["dashboard.html"] = r"""{% extends "base.html" %}
 {% block content %}
 <section class="page-head"><p class="eyebrow">Dashboard</p><h1 class="display">Welcome, {{ user.name or user.email }}.</h1></section>
 {% if api_error %}<div class="alert alert-warn"><strong>AdMob API:</strong> {{ api_error }}</div>{% endif %}
-<section class="grid grid-3">
-  <article class="card"><p class="card-label">Publisher ID</p><p class="card-value mono">{{ publisher_id }}</p></article>
+<section class="grid grid-4 stat-row">
+  <article class="card"><p class="card-label">Publisher ID</p><p class="card-value mono" style="font-size:15px">{{ publisher_id }}</p></article>
   <article class="card"><p class="card-label">Cached apps</p><p class="card-value">{{ app_count }}</p><a class="card-link" href="/apps">Manage →</a></article>
+  <article class="card"><p class="card-label">Ad units</p><p class="card-value">{{ stats.adunit_count }}</p></article>
   <article class="card"><p class="card-label">Mediation groups</p><p class="card-value">{{ group_count }}</p><a class="card-link" href="/mediation">Open →</a></article>
 </section>
 {% if accounts %}
-<section class="card" style="margin:8px 0 20px">
-  <p class="card-label">AdMob Account{% if accounts|length > 1 %} <span class="muted small">(applies in Builder)</span>{% endif %}</p>
-  {% if accounts|length > 1 %}<input type="text" id="acct-search" placeholder="Search accounts…" style="margin:8px 0;max-width:320px" />{% endif %}
-  <div id="acct-chips" class="country-chips"></div>
-  {% if accounts|length > 1 %}
-  <p class="muted small">Applies in the Builder. Add more via admob.google.com → Sync.</p>
+<section class="card acct-card">
+  <div class="acct-head">
+    <p class="card-label" style="margin:0">AdMob account{% if accounts|length > 1 %} <span class="muted small">· used in the Builder</span>{% endif %}</p>
+    {% if accounts|length > 1 %}
+    <details class="m3-menu" id="acct-menu">
+      <summary class="m3-menu-btn"><span id="acct-summary">All accounts</span><span class="chev">▾</span></summary>
+      <div class="m3-menu-list">
+        <input type="text" id="acct-search" placeholder="Search accounts…" />
+        <div id="acct-options"></div>
+      </div>
+    </details>
+    {% endif %}
+  </div>
+  {% if accounts|length == 1 %}
+  <div class="acct-single"><span class="country-chip is-selected">{{ accounts[0].publisher }}</span><span class="muted small">{{ accounts[0].app_count }} app{{ '' if accounts[0].app_count == 1 else 's' }}</span></div>
+  <p class="muted small" style="margin-bottom:0">Have another account? Add it on admob.google.com, then <a href="/apps">Sync</a>.</p>
   {% else %}
-  <p class="muted small">Add another account on admob.google.com → <a href="/apps">Sync</a>.</p>
+  <p class="muted small" style="margin-bottom:0">Choose which accounts' apps appear in the Builder.</p>
   {% endif %}
 </section>
+{% if accounts|length > 1 %}
 <script>
 (function(){
   const ACCOUNTS = {{ accounts|tojson }};
@@ -2336,30 +2406,82 @@ TEMPLATE_FILES["dashboard.html"] = r"""{% extends "base.html" %}
   sel = new Set([...sel].filter(p=>valid.has(p)));
   if (sel.size===0) ACCOUNTS.forEach(a=>sel.add(a.publisher));
   function save(){ try{ localStorage.setItem("selectedPublishers", JSON.stringify([...sel])); }catch(e){} }
+  function summary(){
+    const s = document.getElementById("acct-summary");
+    if (!s) return;
+    if (sel.size === ACCOUNTS.length) s.textContent = "All accounts (" + ACCOUNTS.length + ")";
+    else if (sel.size === 1) s.textContent = [...sel][0];
+    else s.textContent = sel.size + " accounts selected";
+  }
   function render(){
-    const wrap = document.getElementById("acct-chips");
+    const wrap = document.getElementById("acct-options");
     const se = document.getElementById("acct-search");
     const f = ((se ? se.value : "")||"").toLowerCase();
     wrap.innerHTML = "";
     ACCOUNTS.filter(a => !f || a.publisher.toLowerCase().includes(f)).forEach(a => {
       const on = sel.has(a.publisher);
-      const chip = document.createElement("button");
-      chip.type = "button";
-      chip.className = "country-chip" + (on ? " is-selected" : "");
-      chip.textContent = `${a.publisher} (${a.app_count})`;
-      chip.addEventListener("click", () => {
-        if (on) sel.delete(a.publisher); else sel.add(a.publisher);
+      const item = document.createElement("label");
+      item.className = "m3-menu-item";
+      const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = on;
+      const name = document.createElement("span"); name.textContent = a.publisher;
+      const cnt = document.createElement("span"); cnt.className = "muted small"; cnt.textContent = a.app_count;
+      cb.addEventListener("change", () => {
+        if (sel.has(a.publisher)) sel.delete(a.publisher); else sel.add(a.publisher);
         if (sel.size===0) ACCOUNTS.forEach(x=>sel.add(x.publisher));
-        save(); render();
+        save(); summary(); render();
       });
-      wrap.appendChild(chip);
+      item.appendChild(cb); item.appendChild(name); item.appendChild(cnt);
+      wrap.appendChild(item);
     });
   }
-  const __s = document.getElementById("acct-search");
-  if (__s) __s.addEventListener("input", render);
-  save(); render();
+  const se = document.getElementById("acct-search");
+  if (se) se.addEventListener("input", render);
+  save(); summary(); render();
 })();
 </script>
+{% endif %}
+{% endif %}
+
+{% if group_count or app_count %}
+<section class="dash-charts grid grid-2">
+  <div class="card chart-card">
+    <p class="card-label">Mediation groups by format</p>
+    {% if stats.formats %}
+    <div class="bar-chart">
+      {% for b in stats.formats %}
+      <div class="bar-row">
+        <span class="bar-label">{{ b.label|replace('_',' ')|title }}</span>
+        <span class="bar-track"><span class="bar-fill" style="width:{{ b.pct }}%"></span></span>
+        <span class="bar-val">{{ b.value }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="muted small">No mediation groups yet. Open the Builder to create your first one.</p>{% endif %}
+  </div>
+  <div class="card chart-card">
+    <p class="card-label">Apps by platform</p>
+    {% if stats.platforms %}
+    <div class="bar-chart">
+      {% for b in stats.platforms %}
+      <div class="bar-row">
+        <span class="bar-label">{{ b.label|title }}</span>
+        <span class="bar-track"><span class="bar-fill" style="width:{{ b.pct }}%"></span></span>
+        <span class="bar-val">{{ b.value }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="muted small">No apps synced yet.</p>{% endif %}
+    <p class="card-label" style="margin-top:20px">Push status</p>
+    <div class="status-split">
+      <div class="split-seg split-pushed" style="flex:{{ stats.pushed or 0 }}"><span>{{ stats.pushed }}</span></div>
+      <div class="split-seg split-draft" style="flex:{{ stats.draft or 0 }}"><span>{{ stats.draft }}</span></div>
+    </div>
+    <div class="split-legend">
+      <span><i class="dot dot-pushed"></i> {{ stats.pushed }} live in AdMob</span>
+      <span><i class="dot dot-draft"></i> {{ stats.draft }} draft</span>
+    </div>
+  </div>
+</section>
 {% endif %}
 <section class="cta-row">
   <a class="btn-primary" href="/mediation/builder">▶ Open Mediation Builder</a>
@@ -2367,18 +2489,18 @@ TEMPLATE_FILES["dashboard.html"] = r"""{% extends "base.html" %}
   <a class="btn-danger" href="/cleanup">🗑 Delete Ad Units &amp; Groups</a>
 </section>
 <section class="workflow">
-  <h2 class="section-title">How the waterfall builder works</h2>
+  <h2 class="section-title">How it works</h2>
   <ol class="workflow-steps">
     <li><span class="step-no">01</span><span class="step-text">Sign in <span class="done">✓</span></span></li>
-    <li><span class="step-no">02</span><span class="step-text">Sync your AdMob apps &amp; ad units <a href="/apps">→ Apps</a></span></li>
+    <li><span class="step-no">02</span><span class="step-text">Sync your apps &amp; ad units <a href="/apps">→ Apps</a></span></li>
     <li><span class="step-no">03</span><span class="step-text">Open the Builder <a href="/mediation/builder">→ Builder</a></span></li>
-    <li><span class="step-no">04</span><span class="step-text">Select an app + one or more source ad units</span></li>
-    <li><span class="step-no">05</span><span class="step-text">Choose country targeting (Global / Choose / Exclude)</span></li>
-    <li><span class="step-no">06</span><span class="step-text">Set waterfall depth (1–{{ max_lines }}) + floor type</span></li>
-    <li><span class="step-no">07</span><span class="step-text">Fetch live AdMob report (last 7 days)</span></li>
-    <li><span class="step-no">08</span><span class="step-text">Review/edit the calculated tier eCPM values</span></li>
-    <li><span class="step-no">09</span><span class="step-text"><strong>Push to AdMob:</strong> For each source ad unit: (a) create N labeled tier ad units, (b) replicate every bidding mapping (Meta/AppLovin/etc.) from the source onto every tier, (c) create ONE mediation group targeting source + all tiers, with N MANUAL AdMob Network waterfall lines + AdMob Network LIVE bidding line (plus a LIVE line per replicated 3P network).</span></li>
-    <li><span class="step-no">10</span><span class="step-text">Tool reads the group back and audits every line's state. Disabled lines are surfaced as errors.</span></li>
+    <li><span class="step-no">04</span><span class="step-text">Pick an app and one or more ad units</span></li>
+    <li><span class="step-no">05</span><span class="step-text">Choose which countries to target</span></li>
+    <li><span class="step-no">06</span><span class="step-text">Set how many waterfall tiers you want (1–{{ max_lines }})</span></li>
+    <li><span class="step-no">07</span><span class="step-text">Fetch live earnings from AdMob (last 7 days)</span></li>
+    <li><span class="step-no">08</span><span class="step-text">Review the tier eCPM values Flow calculated</span></li>
+    <li><span class="step-no">09</span><span class="step-text">Push — Flow builds the tier ad units and mediation groups in AdMob for you</span></li>
+    <li><span class="step-no">10</span><span class="step-text">Flow double-checks every line and flags anything disabled</span></li>
   </ol>
 </section>
 {% endblock %}"""
@@ -2389,7 +2511,7 @@ TEMPLATE_FILES["cleanup.html"] = r"""{% extends "base.html" %}
 <section class="page-head">
   <p class="eyebrow">Cleanup</p>
   <h1 class="display">Delete ad units &amp; mediation groups</h1>
-  <p class="lede">Pick an app, review what exists in your AdMob account — loaded instantly from the last sync, no API wait — then select all or specific items and delete.</p>
+  <p class="lede">Pick an app to see everything in it, then delete the ad units or groups you no longer need.</p>
 </section>
 
 {% if not apps %}
@@ -2397,7 +2519,7 @@ TEMPLATE_FILES["cleanup.html"] = r"""{% extends "base.html" %}
   <form method="post" action="/apps/sync" style="display:inline"><button class="btn-primary" type="submit">↻ Sync from AdMob</button></form></p></div>
 {% else %}
 <div class="alert alert-warn" style="margin-bottom:20px">
-  <strong>Before you delete:</strong> Ad units are <strong>permanently removed</strong> from AdMob (along with their waterfall &amp; bidding mappings). Mediation groups have no hard-delete in the AdMob API — selected groups are <strong>disabled</strong> (they stop serving and can be re-enabled later).
+  <strong>Before you delete:</strong> Ad units are <strong>permanently removed</strong> from AdMob. Mediation groups can't be deleted through AdMob, so Flow <strong>disables</strong> them instead — they stop serving and you can turn them back on later.
 </div>
 
 <section class="card" style="margin-bottom:18px">
@@ -2638,7 +2760,7 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
 <section class="page-head">
   <p class="eyebrow">Builder</p>
   <h1 class="display">Mediation builder</h1>
-  <p class="lede">Pick app + source ad units → choose targeting → fetch live AdMob report → push creates <strong>N tier ad units, replicated bidding mappings, and ONE mediation group per source ad unit</strong>. AdMob Network is the default — present even when no third-party bidding networks are configured.</p>
+  <p class="lede">Pick an app and its ad units, choose who to target, and fetch live earnings. Flow then calculates the waterfall and builds it in AdMob for you.</p>
 </section>
 
 {% if not apps %}
@@ -2650,23 +2772,23 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
 
 <div class="builder-grid">
   <div>
-    <fieldset class="builder-step" id="account-step" style="display:none">
-      <legend><span class="num">00</span> AdMob Account</legend>
+    <div class="builder-step" id="account-step" style="display:none">
+      <div class="builder-legend"><span class="num">00</span> AdMob Account</div>
       <input type="text" id="account-search" placeholder="Search accounts…" />
       <div id="account-list" class="country-chips" style="margin-top:8px"></div>
-      <p class="muted small">Choose one or more AdMob accounts — only their apps appear below. To add a new account: sign into it on admob.google.com → <a href="/apps">Sync</a>.</p>
-    </fieldset>
+      <p class="muted small">Only the selected accounts' apps show up below.</p>
+    </div>
 
-    <fieldset class="builder-step">
-      <legend><span class="num">01</span> Select App</legend>
+    <div class="builder-step">
+      <div class="builder-legend"><span class="num">01</span> Select App</div>
       <input type="text" id="app-search" placeholder="Search apps by name or ID…" style="margin-bottom:8px" />
       <select id="app-select">
         <option value="">— Choose an app —</option>
       </select>
-    </fieldset>
+    </div>
 
-    <fieldset class="builder-step" id="adunit-step" style="display:none">
-      <legend><span class="num">02</span> Select Source Ad Units</legend>
+    <div class="builder-step" id="adunit-step" style="display:none">
+      <div class="builder-legend"><span class="num">02</span> Select Source Ad Units</div>
       <div class="row-between" style="margin-bottom:10px">
         <input type="text" id="adunit-search" placeholder="Filter ad units…" />
         <div>
@@ -2675,14 +2797,14 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
         </div>
       </div>
       <div id="adunit-list" class="adunit-cards"></div>
-    </fieldset>
+    </div>
 
-    <fieldset class="builder-step">
-      <legend><span class="num">03</span> Country Targeting</legend>
+    <div class="builder-step">
+      <div class="builder-legend"><span class="num">03</span> Country Targeting</div>
       <div class="radio-row">
         <label><input type="radio" name="country_mode" value="GLOBAL" checked /> <span><b>Global</b> — target all countries</span></label>
         <label><input type="radio" name="country_mode" value="INCLUDE" /> <span><b>Choose</b> specific countries</span></label>
-        <label><input type="radio" name="country_mode" value="EXCLUDE" /> <span><b>Exclude</b> specific countries (stored locally; AdMob API has no exclude field)</span></label>
+        <label><input type="radio" name="country_mode" value="EXCLUDE" /> <span><b>Exclude</b> specific countries</span></label>
       </div>
       <div id="country-picker" style="display:none">
         <input type="text" id="country-search" placeholder="Search countries…" />
@@ -2690,10 +2812,10 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
         <p class="muted small">Or paste comma-separated ISO-2 codes:</p>
         <input type="text" id="country-paste" placeholder="US, GB, DE, JP" />
       </div>
-    </fieldset>
+    </div>
 
-    <fieldset class="builder-step">
-      <legend><span class="num">04</span> Waterfall &amp; Bidding</legend>
+    <div class="builder-step">
+      <div class="builder-legend"><span class="num">04</span> Waterfall &amp; Bidding</div>
       <div class="grid grid-2">
         <label><span class="lbl">Number of waterfall lines (1–{{ max_lines }})</span>
           <input type="number" id="line-count" min="1" max="{{ max_lines }}" value="{{ default_lines }}" /></label>
@@ -2704,8 +2826,8 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
       <div class="bidding-callout" id="bidding-callout">
         <div class="bidding-callout-head">
           <div>
-            <strong>⚡ Include All Bidding Networks</strong>
-            <p class="muted small" style="margin:4px 0 0">When ON, all enabled 3P bidding networks saved on <a href="/bidding">/bidding</a> (for this app + format) become LIVE bidding lines in the mediation group. When OFF, only the default AdMob Network LIVE line is added.</p>
+            <strong>⚡ Include all bidding networks</strong>
+            <p class="muted small" style="margin:4px 0 0">On: add every bidding network you've set up on <a href="/bidding">Bidding</a> for this app. Off: use AdMob Network only.</p>
           </div>
           <label class="bidding-toggle">
             <input type="checkbox" id="include-bidding" checked />
@@ -2713,7 +2835,7 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
           </label>
         </div>
       </div>
-    </fieldset>
+    </div>
 
     <div class="report-source" style="margin:4px 0 14px">
       <span class="lbl" style="display:block;margin-bottom:6px">eCPM source</span>
@@ -2767,8 +2889,8 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
     <span class="muted small">Every tier value is clamped to <b>${{ min_ecpm }}</b> – <b>${{ max_ecpm|int }}</b>.</span>
   </div>
   <div class="form-actions">
-    <button class="btn-primary btn-lg" id="push-btn">▶ Create mediation group + waterfall + bidding</button>
-    <button class="btn-secondary btn-lg" id="generate-btn">Save locally only (preview/draft)</button>
+    <button class="btn-primary btn-lg" id="push-btn">▶ Push to AdMob</button>
+    <button class="btn-secondary btn-lg" id="generate-btn">Save as draft</button>
   </div>
 
   <hr style="margin: 32px 0; border: 0; border-top: 1px solid var(--line)" />
@@ -3474,7 +3596,7 @@ TEMPLATE_FILES["networks.html"] = r"""{% extends "base.html" %}
 <section class="page-head">
   <p class="eyebrow">3rd-party networks</p>
   <h1 class="display">Network credentials</h1>
-  <p class="lede">Per-app credentials for each ad network. Stored encrypted. Used as documentation; the actual mappings are read live from AdMob during the push.</p>
+  <p class="lede">Save your ad network keys and IDs for each app. Everything is stored encrypted.</p>
 </section>
 
 {% if not apps %}
@@ -3573,7 +3695,7 @@ TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
 <section class="page-head">
   <p class="eyebrow">Bidding setup</p>
   <h1 class="display">3rd-party bidding networks</h1>
-  <p class="lede">For each <b>app</b> + <b>network</b> + <b>ad format</b>, you fill the mapping <b>once</b> and pick which ad unit it applies to. Each (network, format) → one mapping. When the builder's "Include All Bidding Networks" is on AND the pushed source ad unit matches this mapping's ad unit, it becomes a LIVE bidding line on the mediation group.</p>
+  <p class="lede">Set up each bidding network once per app and ad format. The Builder then adds them to your mediation groups automatically.</p>
 </section>
 
 {% if not apps %}
@@ -3612,8 +3734,8 @@ TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
     <!-- AUTO-CHECK: existing mediation groups for this app, per format -->
     <section class="bid-existing-card">
       <header class="bid-existing-head">
-        <h3>Existing Mediation Groups</h3>
-        <p class="muted small" style="margin:4px 0 0">Auto-fetched from your AdMob account for this app. "Mediation group not found" = nothing exists yet for that format, push will create new.</p>
+        <h3>Existing mediation groups</h3>
+        <p class="muted small" style="margin:4px 0 0">What's already set up in AdMob for this app. "Not found" just means Flow will create a new one when you push.</p>
       </header>
       <div class="bid-existing-grid" data-app="{{ a.id }}">
         <div class="bid-existing-loading muted small">Loading from AdMob…</div>
@@ -3623,8 +3745,8 @@ TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
     <!-- STEP 1: Format Support Summary -->
     <section class="bid-step-card">
       <header class="bid-step-head">
-        <h3>Step 1: Format Support Summary</h3>
-        <p class="muted small">Select which ad sources you want to enable for each ad format. Tap a chip to toggle.</p>
+        <h3>Step 1 · Choose networks</h3>
+        <p class="muted small">Tap a network to turn it on for that ad format.</p>
       </header>
 
       {% for fmt in formats %}
@@ -3657,8 +3779,8 @@ TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
     <!-- STEP 2: Configure Ad Units -->
     <section class="bid-step-card">
       <header class="bid-step-head">
-        <h3>Step 2: Configure Ad Units</h3>
-        <p class="muted small">Enter the required configuration values for selected ad sources. Each (network × format) is one mapping — pick the ad unit it applies to and fill the network's values.</p>
+        <h3>Step 2 · Enter each network's details</h3>
+        <p class="muted small">Fill in the keys and IDs for the networks you turned on, and pick the ad unit each one applies to.</p>
       </header>
 
       {% for fmt in formats %}
@@ -3729,10 +3851,10 @@ TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
     <section class="bid-step-card bid-preview-card">
       <header class="bid-preview-head">
         <div>
-          <h3>JSON Preview</h3>
-          <p class="muted small" style="margin:4px 0 0">Review the configuration before saving</p>
+          <h3>Preview</h3>
+          <p class="muted small" style="margin:4px 0 0">See exactly what will be saved.</p>
         </div>
-        <button type="button" class="btn-secondary btn-sm bid-preview-toggle">Show Preview</button>
+        <button type="button" class="btn-secondary btn-sm bid-preview-toggle">Show preview</button>
       </header>
       <pre class="bid-preview-json" style="display:none"></pre>
     </section>
@@ -3741,10 +3863,10 @@ TEMPLATE_FILES["bidding.html"] = r"""{% extends "base.html" %}
     <section class="bid-confirm-card">
       <label class="bid-confirm">
         <input type="checkbox" class="bid-confirm-cb" />
-        <span><strong>I confirm</strong> this configuration will be saved. Please review the configuration above before proceeding.</span>
+        <span>I've reviewed the details above and I'm ready to save.</span>
       </label>
       <button type="button" class="btn-primary btn-lg bid-save-all" disabled>
-        💾  Save Bidding Configurations
+        💾  Save
       </button>
       <div class="bid-save-result muted small"></div>
     </section>
@@ -3925,20 +4047,62 @@ document.querySelectorAll('.bid-save-all').forEach(btn => {
 {% endif %}
 {% endblock %}"""
 
-CSS_CONTENT = r""":root {
-  --bg: #0e0d0b; --bg-2: #16140f; --bg-3: #1d1a14;
-  --line: #2a261d; --line-2: #3a3326;
-  --ink: #f1ecdf; --ink-dim: #b8b09d; --ink-mute: #847c69;
-  --accent: #f4b942; --accent-2: #ef6f3c;
-  --good: #7fb685; --bad: #e2705b;
-  --font-display: "Fraunces", "Iowan Old Style", Charter, Georgia, serif;
-  --font-body: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "JetBrains Mono", Menlo, monospace;
-  --radius: 6px; --radius-lg: 10px;
+CSS_CONTENT = r""":root, :root[data-theme="light"] {
+  /* ---- Material 3 color roles — Professional Blue seed (LIGHT) ---- */
+  --primary: #0b57d0; --on-primary: #ffffff;
+  --primary-container: #d8e2ff; --on-primary-container: #001b3f;
+  --secondary: #565f71; --secondary-container: #dae2f9; --on-secondary-container: #131c2b;
+  --surface: #eceef7; --surface-container-lowest: #ffffff;
+  --surface-container-low: #ffffff; --surface-container: #f3f4fb;
+  --surface-container-high: #ebedf6; --surface-container-highest: #e4e6f1;
+  --on-surface: #1a1b20; --on-surface-variant: #45464f;
+  --outline: #757680; --outline-variant: #d3d5e0;
+  --inverse-surface: #2f3036; --inverse-on-surface: #f1f0f7; --inverse-primary: #aac7ff;
+  --error: #ba1a1a; --on-error: #ffffff; --error-container: #ffdad6; --on-error-container: #410002;
+  --success: #146c2e; --scrim: rgba(0,0,0,0.32);
+  --shadow-1: 0 1px 3px rgba(28,40,80,0.10), 0 1px 2px rgba(28,40,80,0.06);
+  --shadow-2: 0 4px 10px rgba(28,40,80,0.12), 0 2px 4px rgba(28,40,80,0.07);
+  --shadow-3: 0 14px 34px rgba(28,40,80,0.20);
+  --accent-rgb: 11,87,208; --good-rgb: 20,108,46; --bad-rgb: 186,26,26;
+  --fill-subtle: #eceef3; --fill-hover: rgba(0,0,0,0.045);
+  /* ---- back-compat aliases (all existing var(--…) usages adopt M3) ---- */
+  --bg: var(--surface); --bg-2: var(--surface-container-low); --bg-3: var(--surface-container-high);
+  --line: var(--outline-variant); --line-2: #b7b9c2;
+  --ink: var(--on-surface); --ink-dim: var(--on-surface-variant); --ink-mute: #6d7079;
+  --accent: var(--primary); --accent-2: #0842a0;
+  --good: var(--success); --bad: var(--error);
+  --font-display: "Google Sans", "Product Sans", Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-body: Roboto, "Google Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "Roboto Mono", ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+  --radius: 8px; --radius-lg: 16px; --radius-pill: 100px;
+}
+:root[data-theme="dark"] {
+  /* ---- Material 3 color roles — Professional Blue seed (DARK) ---- */
+  --primary: #aac7ff; --on-primary: #0a305f;
+  --primary-container: #274777; --on-primary-container: #d8e2ff;
+  --secondary: #bec6dc; --secondary-container: #3e4759; --on-secondary-container: #dae2f9;
+  --surface: #121316; --surface-container-lowest: #0d0e11;
+  --surface-container-low: #1a1b1f; --surface-container: #1e1f23;
+  --surface-container-high: #282a2e; --surface-container-highest: #333438;
+  --on-surface: #e3e2e6; --on-surface-variant: #c4c6cf;
+  --outline: #8e9099; --outline-variant: #44474e;
+  --inverse-surface: #e3e2e6; --inverse-on-surface: #2f3033; --inverse-primary: #0b57d0;
+  --error: #ffb4ab; --on-error: #690005; --error-container: #93000a; --on-error-container: #ffdad6;
+  --success: #6fd98a; --scrim: rgba(0,0,0,0.55);
+  --shadow-1: 0 1px 2px rgba(0,0,0,0.35), 0 1px 3px rgba(0,0,0,0.30);
+  --shadow-2: 0 2px 6px rgba(0,0,0,0.45), 0 1px 2px rgba(0,0,0,0.35);
+  --shadow-3: 0 10px 30px rgba(0,0,0,0.55);
+  --accent-rgb: 170,199,255; --good-rgb: 111,217,138; --bad-rgb: 255,180,171;
+  --fill-subtle: #24262b; --fill-hover: rgba(255,255,255,0.06);
+  --bg: var(--surface); --bg-2: var(--surface-container-low); --bg-3: var(--surface-container-high);
+  --line: var(--outline-variant); --line-2: #5b5e66;
+  --ink: var(--on-surface); --ink-dim: var(--on-surface-variant); --ink-mute: #93949c;
+  --accent: var(--primary); --accent-2: #c5d9ff;
+  --good: var(--success); --bad: var(--error);
 }
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.55; -webkit-font-smoothing: antialiased; }
-body { background: radial-gradient(1200px 600px at 85% -10%, rgba(244,185,66,0.07), transparent 60%), radial-gradient(900px 500px at 10% 110%, rgba(239,111,60,0.05), transparent 55%), var(--bg); min-height: 100vh; }
+body { background: var(--bg); min-height: 100vh; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { color: var(--accent-2); }
 code, .mono { font-family: var(--font-mono); }
@@ -3964,7 +4128,7 @@ code, .mono { font-family: var(--font-mono); }
 .footer-version:hover { text-decoration: underline; }
 .changelog { max-width: 780px; }
 .changelog-entry { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 20px 24px; margin-bottom: 16px; }
-.changelog-entry.is-current { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(244,185,66,0.25); }
+.changelog-entry.is-current { border-color: var(--accent); box-shadow: 0 0 0 1px rgba(var(--accent-rgb),0.25); }
 .changelog-head { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
 .changelog-ver { font-family: var(--font-mono); font-size: 20px; font-weight: 600; color: var(--accent); }
 .changelog-title { font-family: var(--font-display); font-size: 16px; color: var(--ink); }
@@ -4007,7 +4171,8 @@ code, .mono { font-family: var(--font-mono); }
 .btn-danger:hover { border-color: var(--bad); }
 .btn-sm { padding: 6px 10px; font-size: 12.5px; }
 button:disabled { opacity: .5; cursor: not-allowed; }
-.g-mark { display: inline-grid; place-items: center; width: 22px; height: 22px; border-radius: 50%; background: #1a1407; color: var(--accent); font-family: var(--font-display); font-weight: 600; }
+.g-mark { display: inline-grid; place-items: center; width: 28px; height: 28px; border-radius: 50%; background: #ffffff; box-shadow: 0 1px 2px rgba(0,0,0,0.18); margin-right: 2px; }
+.g-mark svg { display: block; }
 .login-wrap { display: grid; grid-template-columns: 1.4fr 0.8fr; gap: 60px; align-items: start; padding-top: 30px; }
 @media (max-width: 900px) { .login-wrap { grid-template-columns: 1fr; gap: 30px; } }
 .login-card .fineprint { color: var(--ink-mute); font-size: 12.5px; margin-top: 16px; }
@@ -4023,20 +4188,20 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .table tr:last-child td { border-bottom: 0; }
 .table tr:hover td { background: rgba(255,255,255,0.015); }
 .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; background: var(--bg-3); border: 1px solid var(--line-2); font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.04em; color: var(--ink-dim); }
-.pill-android { color: var(--good); border-color: rgba(127,182,133,0.3); }
+.pill-android { color: var(--good); border-color: rgba(var(--good-rgb),0.3); }
 .pill-ios { color: #9bb7e2; border-color: rgba(155,183,226,0.3); }
-.pill-good { background: rgba(127,182,133,0.18); color: var(--good); }
+.pill-good { background: rgba(var(--good-rgb),0.18); color: var(--good); }
 .status { display: inline-block; padding: 3px 9px; border-radius: 4px; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.05em; }
 .status-draft { color: var(--ink-mute); background: rgba(132,124,105,0.12); }
-.status-generated { color: var(--accent); background: rgba(244,185,66,0.12); }
-.status-pushed { color: var(--good); background: rgba(127,182,133,0.16); }
-.status-pushed_partial { color: var(--accent); background: rgba(244,185,66,0.16); }
+.status-generated { color: var(--accent); background: rgba(var(--accent-rgb),0.12); }
+.status-pushed { color: var(--good); background: rgba(var(--good-rgb),0.16); }
+.status-pushed_partial { color: var(--accent); background: rgba(var(--accent-rgb),0.16); }
 .status-push_failed { color: var(--bad); background: rgba(226,112,91,0.14); }
 label { display: flex; flex-direction: column; gap: 6px; }
 .lbl { color: var(--ink-dim); font-size: 12.5px; }
 input[type="text"], input[type="number"], input[type="password"], input:not([type]), select, textarea { background: var(--bg-3); color: var(--ink); border: 1px solid var(--line-2); border-radius: var(--radius); padding: 9px 12px; font: 400 14px/1.3 var(--font-body); color-scheme: dark; }
 select option { background: var(--bg-2); color: var(--ink); }
-input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(244,185,66,0.12); }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(var(--accent-rgb),0.12); }
 .builder-grid { display: grid; grid-template-columns: 1.4fr 0.8fr; gap: 28px; align-items: start; }
 @media (max-width: 1000px) { .builder-grid { grid-template-columns: 1fr; } }
 .builder-step { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 18px 20px; margin-bottom: 18px; }
@@ -4052,13 +4217,13 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .kv span { color: var(--ink-mute); }
 .kv b { color: var(--ink); font-weight: 500; }
 .adunit-cards { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow-y: auto; padding-right: 6px; }
-.adunit-card { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: rgba(0,0,0,0.18); border: 1px solid var(--line); border-radius: var(--radius); gap: 12px; cursor: pointer; transition: border-color .12s ease, background .12s ease; }
-.adunit-card:hover { border-color: var(--ink-mute); background: rgba(255,255,255,0.03); }
-.adunit-card.is-selected { border-color: var(--accent); background: rgba(244,185,66,0.06); }
-.adunit-card.is-selected:hover { background: rgba(244,185,66,0.10); }
+.adunit-card { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; background: var(--fill-subtle); border: 1px solid var(--line); border-radius: var(--radius); gap: 12px; cursor: pointer; transition: border-color .12s ease, background .12s ease; }
+.adunit-card:hover { border-color: var(--ink-mute); background: var(--fill-hover); }
+.adunit-card.is-selected { border-color: var(--accent); background: rgba(var(--accent-rgb),0.06); }
+.adunit-card.is-selected:hover { background: rgba(var(--accent-rgb),0.10); }
 .adunit-card .adunit-name { font-weight: 500; }
 .adunit-card .adunit-id { color: var(--ink-mute); }
-.sel-unit { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; background: rgba(0,0,0,0.18); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 8px; }
+.sel-unit { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 10px; background: var(--fill-subtle); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 8px; }
 .sel-unit-info { min-width: 0; }
 .sel-unit-name { font-weight: 500; font-size: 13.5px; }
 .sel-unit-remove { flex: none; width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--line-2); background: transparent; color: var(--bad); cursor: pointer; font-size: 14px; line-height: 1; }
@@ -4066,7 +4231,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .country-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; max-height: 220px; overflow-y: auto; }
 .country-chip { background: var(--bg-3); border: 1px solid var(--line-2); color: var(--ink-dim); padding: 6px 10px; border-radius: 999px; font-family: var(--font-mono); font-size: 12px; cursor: pointer; }
 .country-chip:hover { border-color: var(--ink-mute); }
-.country-chip.is-selected { background: rgba(244,185,66,0.16); color: var(--accent); border-color: var(--accent); }
+.country-chip.is-selected { background: rgba(var(--accent-rgb),0.16); color: var(--accent); border-color: var(--accent); }
 #push-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.74); z-index: 9999; display: flex; align-items: center; justify-content: center; }
 .push-modal { background: var(--bg-2); border: 1px solid var(--line-2); border-radius: var(--radius-lg); padding: 28px 32px; width: min(440px, 90vw); text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.55); }
 .push-title { font-family: var(--font-display); font-size: 18px; font-weight: 500; margin: 0 0 14px; }
@@ -4088,15 +4253,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .metric-value { font-family: var(--font-display); font-size: 20px; color: var(--accent); }
 .metric-value.good { color: var(--good); }
 .line-table { margin-top: 12px; border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; }
-.line-table-head { display: grid; grid-template-columns: 50px 1fr 1.4fr; gap: 10px; padding: 8px 12px; background: rgba(0,0,0,0.18); font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-mute); }
+.line-table-head { display: grid; grid-template-columns: 50px 1fr 1.4fr; gap: 10px; padding: 8px 12px; background: var(--fill-subtle); font-family: var(--font-mono); font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--ink-mute); }
 .line-table-row { display: grid; grid-template-columns: 50px 1fr 1.4fr; gap: 10px; padding: 8px 12px; border-top: 1px solid var(--line); align-items: center; }
-.default-network-note { margin-top: 12px; padding: 10px 14px; background: rgba(244,185,66,0.07); border: 1px solid rgba(244,185,66,0.25); border-radius: var(--radius); color: var(--ink-dim); font-size: 13px; }
+.default-network-note { margin-top: 12px; padding: 10px 14px; background: rgba(var(--accent-rgb),0.07); border: 1px solid rgba(var(--accent-rgb),0.25); border-radius: var(--radius); color: var(--ink-dim); font-size: 13px; }
 .networks-page { display: grid; grid-template-columns: 220px 1fr; gap: 28px; align-items: start; }
 @media (max-width: 900px) { .networks-page { grid-template-columns: 1fr; } }
 .net-app-list { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 16px; position: sticky; top: 84px; }
 .net-app-list h3 { margin: 0 0 12px; font-family: var(--font-display); font-size: 16px; font-weight: 500; }
 .net-app-link { display: block; padding: 10px 12px; border-radius: var(--radius); color: var(--ink-dim); margin-bottom: 6px; }
-.net-app-link:hover { background: rgba(255,255,255,0.03); color: var(--ink); }
+.net-app-link:hover { background: var(--fill-hover); color: var(--ink); }
 .net-app-section { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 22px; margin-bottom: 22px; }
 .net-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin: 20px 0 16px; border-bottom: 1px solid var(--line); }
 .net-tab { background: transparent; color: var(--ink-mute); border: 0; border-bottom: 2px solid transparent; padding: 10px 14px; cursor: pointer; font: 500 13px/1 var(--font-body); }
@@ -4105,15 +4270,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .net-tab-content { display: none; }
 .net-tab-content.is-active { display: block; }
 .net-tab-content h4 { font-family: var(--font-display); font-weight: 500; margin: 0 0 12px; font-size: 16px; }
-.net-form { padding: 14px; background: rgba(0,0,0,0.18); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 10px; }
-.net-unit-row { padding: 12px 14px; background: rgba(0,0,0,0.12); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 8px; }
+.net-form { padding: 14px; background: var(--fill-subtle); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 10px; }
+.net-unit-row { padding: 12px 14px; background: var(--fill-subtle); border: 1px solid var(--line); border-radius: var(--radius); margin-bottom: 8px; }
 .net-unit-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
 .calc-explainer { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px 16px; color: var(--ink-dim); font-size: 13px; margin: 18px 0; }
-.callout { background: rgba(244,185,66,0.08); border: 1px solid rgba(244,185,66,0.25); border-radius: var(--radius); padding: 12px 16px; color: var(--ink-dim); font-size: 13px; margin-top: 24px; }
+.callout { background: rgba(var(--accent-rgb),0.08); border: 1px solid rgba(var(--accent-rgb),0.25); border-radius: var(--radius); padding: 12px 16px; color: var(--ink-dim); font-size: 13px; margin-top: 24px; }
 .empty { background: var(--bg-2); border: 1px dashed var(--line-2); border-radius: var(--radius-lg); padding: 40px; text-align: center; color: var(--ink-dim); }
 .empty p { margin-top: 0; }
 .alert { border-radius: var(--radius); padding: 12px 16px; margin-bottom: 20px; font-size: 14px; }
-.alert-warn { background: rgba(244,185,66,0.07); border: 1px solid rgba(244,185,66,0.3); color: var(--accent); }
+.alert-warn { background: rgba(var(--accent-rgb),0.07); border: 1px solid rgba(var(--accent-rgb),0.3); color: var(--accent); }
 .actions-col { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
 .actions-col form { display: inline; }
 .forensic-block { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; font-family: var(--font-mono); font-size: 11.5px; color: var(--ink-dim); overflow-x: auto; max-height: 240px; }
@@ -4139,10 +4304,10 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .bid-fmt-summary > header { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 10px; }
 .bid-fmt-label { font-family: var(--font-mono); font-size: 13px; letter-spacing: 0.06em; color: var(--ink); font-weight: 600; }
 .bid-count { font-size: 11px; padding: 4px 10px; border-radius: 999px; background: var(--bg-3); color: var(--ink-mute); border: 1px solid var(--line); white-space: nowrap; }
-.bid-count.is-on { background: rgba(244,185,66,0.12); color: var(--accent); border-color: rgba(244,185,66,0.4); }
+.bid-count.is-on { background: rgba(var(--accent-rgb),0.12); color: var(--accent); border-color: rgba(var(--accent-rgb),0.4); }
 .bid-chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .bid-chip { display: inline-flex; padding: 8px 16px; border-radius: 999px; background: var(--bg-3); border: 1px solid var(--line); color: var(--ink-dim); font-size: 13px; cursor: pointer; transition: all 0.15s; user-select: none; font-weight: 500; }
-.bid-chip:hover { border-color: rgba(244,185,66,0.4); color: var(--ink); }
+.bid-chip:hover { border-color: rgba(var(--accent-rgb),0.4); color: var(--ink); }
 .bid-chip.is-on { background: var(--accent-2); border-color: var(--accent-2); color: white; }
 .bid-chip.is-on:hover { background: var(--accent); border-color: var(--accent); color: white; }
 
@@ -4154,7 +4319,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .bid-fmt-section-body { padding: 18px; display: flex; flex-direction: column; gap: 14px; }
 
 .bid-net-form { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; transition: border-color 0.2s, background 0.2s; display: flex; flex-direction: column; gap: 12px; }
-.bid-net-form.is-on { border-color: rgba(244,185,66,0.45); background: rgba(244,185,66,0.03); }
+.bid-net-form.is-on { border-color: rgba(var(--accent-rgb),0.45); background: rgba(var(--accent-rgb),0.03); }
 .bid-net-form-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .bid-net-toggle-wrap { display: flex; align-items: center; gap: 12px; cursor: pointer; user-select: none; }
 .bid-net-name-big { font-weight: 600; color: var(--ink); font-size: 15px; }
@@ -4172,7 +4337,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .bid-preview-json { background: var(--bg-3); border: 1px solid var(--line); border-radius: 8px; padding: 14px; margin-top: 14px; max-height: 360px; overflow: auto; font-family: var(--font-mono); font-size: 12px; color: var(--ink-dim); }
 
 .bid-confirm-card { background: var(--bg-2); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px 22px; display: flex; flex-direction: column; gap: 16px; }
-.bid-confirm { display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px; background: rgba(244,185,66,0.06); border: 1px solid rgba(244,185,66,0.25); border-radius: 8px; cursor: pointer; user-select: none; }
+.bid-confirm { display: flex; align-items: flex-start; gap: 12px; padding: 12px 16px; background: rgba(var(--accent-rgb),0.06); border: 1px solid rgba(var(--accent-rgb),0.25); border-radius: 8px; cursor: pointer; user-select: none; }
 .bid-confirm input { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--accent); cursor: pointer; }
 .bid-confirm span { font-size: 13px; color: var(--ink); line-height: 1.5; }
 .bid-save-all { width: 100%; padding: 14px 20px; font-size: 15px; font-weight: 600; background: var(--accent-2); border: 1px solid var(--accent-2); color: white; border-radius: var(--radius); cursor: pointer; transition: all 0.15s; display: flex; align-items: center; justify-content: center; gap: 10px; }
@@ -4188,25 +4353,25 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .bid-existing-grid { display: flex; flex-direction: column; gap: 8px; }
 .bid-existing-loading { padding: 12px 0; }
 .bid-existing-row { display: grid; grid-template-columns: 140px 1fr; align-items: center; gap: 16px; padding: 10px 14px; background: var(--bg-3); border: 1px solid var(--line); border-radius: 6px; }
-.bid-existing-row.has-groups { border-color: rgba(127,182,133,0.3); background: rgba(127,182,133,0.04); }
+.bid-existing-row.has-groups { border-color: rgba(var(--good-rgb),0.3); background: rgba(var(--good-rgb),0.04); }
 .bid-existing-fmt { font-family: var(--font-mono); font-size: 13px; letter-spacing: 0.04em; color: var(--ink); font-weight: 600; }
 .bid-existing-status { display: flex; flex-wrap: wrap; gap: 6px; }
 .bid-existing-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 10px; border-radius: 999px; background: var(--bg-2); border: 1px solid var(--line); color: var(--ink); }
-.bid-existing-pill.on { border-color: rgba(127,182,133,0.4); color: var(--good); }
+.bid-existing-pill.on { border-color: rgba(var(--good-rgb),0.4); color: var(--good); }
 .bid-existing-pill.off { color: var(--ink-mute); }
 .bid-not-found { font-size: 12px; color: var(--ink-mute); font-style: italic; }
 
 /* "Saved configurations loaded" status banner */
 .bid-loaded-banner { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); padding: 10px 16px; display: flex; flex-wrap: wrap; align-items: center; gap: 14px; font-size: 13px; }
-.bid-loaded-banner.has-saved { border-color: rgba(127,182,133,0.35); background: rgba(127,182,133,0.05); }
-.bid-loaded-pill { padding: 4px 12px; border-radius: 999px; background: rgba(127,182,133,0.15); border: 1px solid rgba(127,182,133,0.4); color: var(--good); font-weight: 600; font-size: 12px; }
+.bid-loaded-banner.has-saved { border-color: rgba(var(--good-rgb),0.35); background: rgba(var(--good-rgb),0.05); }
+.bid-loaded-pill { padding: 4px 12px; border-radius: 999px; background: rgba(var(--good-rgb),0.15); border: 1px solid rgba(var(--good-rgb),0.4); color: var(--good); font-weight: 600; font-size: 12px; }
 .bid-loaded-pill.bid-loaded-empty { background: var(--bg-2); border-color: var(--line); color: var(--ink-mute); font-weight: 500; }
 .bid-db-info { margin-left: auto; }
 .bid-db-info code { font-family: var(--font-mono); background: var(--bg-2); padding: 2px 6px; border-radius: 4px; border: 1px solid var(--line); }
 
 /* Builder: "Include All Bidding Networks" callout + iOS-style toggle */
 .bidding-callout { background: var(--bg-3); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 18px; margin: 14px 0; transition: border-color 0.2s, background 0.2s; }
-.bidding-callout.is-on { border-color: rgba(244,185,66,0.5); background: rgba(244,185,66,0.06); }
+.bidding-callout.is-on { border-color: rgba(var(--accent-rgb),0.5); background: rgba(var(--accent-rgb),0.06); }
 .bidding-callout-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
 .bidding-callout-head > div { flex: 1; }
 .bidding-callout-head strong { font-size: 14px; color: var(--ink); }
@@ -4215,7 +4380,295 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .bidding-slider { position: absolute; inset: 0; background: var(--bg-2); border: 1px solid var(--line); border-radius: 999px; transition: background 0.2s, border-color 0.2s; }
 .bidding-slider::before { content: ""; position: absolute; left: 3px; top: 3px; width: 18px; height: 18px; background: var(--ink-mute); border-radius: 50%; transition: transform 0.2s, background 0.2s; }
 .bidding-toggle input:checked + .bidding-slider { background: var(--accent); border-color: var(--accent); }
-.bidding-toggle input:checked + .bidding-slider::before { transform: translateX(22px); background: white; }
+.bidding-toggle input:checked + .bidding-slider::before { transform: translateX(22px); background: var(--on-primary); }
+
+/* ======================================================================
+   MATERIAL 3 REFINEMENTS  (appended — override earlier component styles)
+   Full sans typography, tonal surfaces, pill buttons with state layers,
+   clean cards, M3 text fields, top app bar, theme toggle, dialog, snackbar.
+   ====================================================================== */
+html, body { font-size: 14.5px; line-height: 1.5; }
+::selection { background: rgba(var(--accent-rgb),0.24); }
+* { scrollbar-color: var(--outline) transparent; }
+
+/* ---- Top app bar ---- */
+.topbar { padding: 12px 24px; background: var(--surface-container-low); border-bottom: 1px solid var(--outline-variant); backdrop-filter: none; }
+.brand-mark { color: var(--primary); font-size: 22px; }
+.brand-name { font-family: var(--font-display); font-weight: 600; font-size: 20px; letter-spacing: -0.01em; color: var(--on-surface); }
+.brand-dot { color: var(--primary); }
+.topnav { gap: 4px; }
+.topnav a { color: var(--on-surface-variant); font-size: 13.5px; font-weight: 500; padding: 8px 12px; border-radius: var(--radius-pill); transition: background .15s ease, color .15s ease; }
+.topnav a:hover { color: var(--on-surface); background: var(--fill-hover); }
+.topnav a.cta { color: var(--primary); }
+.topnav a.cta:hover { background: rgba(var(--accent-rgb),0.10); }
+.topnav .sep { background: var(--outline-variant); margin: 0 4px; }
+.user-chip { color: var(--on-surface-variant); font-size: 12.5px; padding-left: 6px; }
+.user-chip img { border: 1px solid var(--outline-variant); }
+.topnav .logout { color: var(--on-surface-variant); padding: 8px 12px; border-radius: var(--radius-pill); }
+.topnav .logout:hover { background: var(--fill-hover); color: var(--on-surface); }
+
+/* ---- Theme toggle (added in base.html) ---- */
+.theme-toggle { display: inline-flex; align-items: center; justify-content: center; width: 40px; height: 40px; border-radius: var(--radius-pill); border: none; background: transparent; color: var(--on-surface-variant); cursor: pointer; font-size: 18px; line-height: 1; transition: background .15s ease, color .15s ease; }
+.theme-toggle:hover { background: var(--fill-hover); color: var(--on-surface); }
+.theme-toggle .icon-dark { display: none; }
+:root[data-theme="dark"] .theme-toggle .icon-dark { display: inline; }
+:root[data-theme="dark"] .theme-toggle .icon-light { display: none; }
+
+/* ---- Typography ---- */
+.display { font-family: var(--font-display); font-weight: 600; letter-spacing: -0.02em; color: var(--on-surface); }
+.display em { font-style: normal; color: var(--primary); }
+.section-title { font-family: var(--font-display); font-weight: 600; color: var(--on-surface); }
+.eyebrow { font-family: var(--font-body); color: var(--primary); font-weight: 600; letter-spacing: 0.08em; }
+.card-label, .metric-label, .line-table-head, .step-no { font-family: var(--font-body); }
+.card-value { font-family: var(--font-display); font-weight: 600; color: var(--on-surface); }
+.lede, .step-text { color: var(--on-surface-variant); }
+
+/* ---- Buttons: M3 pill shape + state layers ---- */
+.btn-primary, .btn-secondary, .btn-ghost, .btn-danger { font: 500 14px/1 var(--font-body); padding: 0 22px; height: 40px; border-radius: var(--radius-pill); border: 1px solid transparent; letter-spacing: 0.01em; position: relative; overflow: hidden; }
+.btn-primary { background: var(--primary); color: var(--on-primary); border-color: var(--primary); box-shadow: var(--shadow-1); }
+.btn-primary:hover { background: var(--accent-2); border-color: var(--accent-2); color: var(--on-primary); box-shadow: var(--shadow-2); }
+.btn-primary:active { box-shadow: none; }
+.btn-primary.btn-lg { height: 48px; padding: 0 28px; font-size: 15px; }
+.btn-secondary { background: transparent; color: var(--primary); border-color: var(--outline); }
+.btn-secondary:hover { border-color: var(--primary); background: rgba(var(--accent-rgb),0.08); color: var(--primary); }
+.btn-ghost { background: transparent; color: var(--primary); border-color: transparent; }
+.btn-ghost:hover { background: rgba(var(--accent-rgb),0.10); color: var(--primary); border-color: transparent; }
+.btn-danger { background: transparent; color: var(--error); border-color: var(--outline); }
+.btn-danger:hover { background: rgba(var(--bad-rgb),0.09); border-color: var(--error); color: var(--error); }
+.btn-sm { height: 32px; padding: 0 14px; font-size: 13px; }
+
+/* ---- Cards & surfaces: tonal elevation, softer radius ---- */
+.card { background: var(--surface-container-low); border: none; border-radius: var(--radius-lg); box-shadow: var(--shadow-1); }
+:root[data-theme="dark"] .card { border: 1px solid var(--outline-variant); }
+.card:hover { box-shadow: var(--shadow-2); }
+.card-link { color: var(--primary); font-weight: 500; }
+.report-card, .net-app-section, .net-app-list, .bid-app-pick, .bid-step-card,
+.bid-confirm-card, .bid-existing-card, .empty, .changelog-entry, .login-card, .login-side { border-radius: var(--radius-lg); }
+.report-card, .net-app-section, .bid-step-card { box-shadow: var(--shadow-1); }
+.changelog-entry.is-current { border-color: var(--primary); box-shadow: 0 0 0 1px rgba(var(--accent-rgb),0.30); }
+.changelog-ver, .changelog-title { color: var(--on-surface); }
+.changelog-ver { color: var(--primary); }
+
+/* ---- M3 text fields ---- */
+input[type="text"], input[type="number"], input[type="password"], input:not([type]), select, textarea {
+  background: var(--surface-container-highest); color: var(--on-surface);
+  border: 1px solid var(--outline); border-radius: var(--radius);
+  padding: 11px 14px; font: 400 14px/1.3 var(--font-body); color-scheme: light dark;
+  transition: border-color .15s ease, box-shadow .15s ease; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(var(--accent-rgb),0.28); }
+input::placeholder, textarea::placeholder { color: var(--on-surface-variant); opacity: 0.75; }
+
+/* ---- Chips (country / account / bidding) ---- */
+.country-chip, .bid-chip, .bid-count, .bid-section-badge, .pill { border-radius: var(--radius-pill); }
+.country-chip { background: transparent; border: 1px solid var(--outline); color: var(--on-surface-variant); }
+.country-chip:hover { background: var(--fill-hover); border-color: var(--outline); }
+.country-chip.is-selected { background: rgba(var(--accent-rgb),0.14); color: var(--primary); border-color: var(--primary); }
+.bid-chip { background: transparent; border: 1px solid var(--outline); color: var(--on-surface-variant); }
+.bid-chip:hover { border-color: var(--primary); color: var(--on-surface); background: var(--fill-hover); }
+.bid-chip.is-on, .bid-chip.is-on:hover { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
+.pill { background: var(--secondary-container); color: var(--on-secondary-container); border: none; padding: 3px 10px; font-size: 11px; font-weight: 500; }
+
+/* ---- Selected-unit list / adunit cards ---- */
+.adunit-card, .sel-unit, .metric, .net-form, .net-unit-row, .calc-explainer,
+.forensic-block, .bid-net-form, .bid-fmt-section, .bid-existing-row, .bidding-callout { border-radius: var(--radius); }
+.adunit-card:hover { border-color: var(--primary); background: var(--fill-hover); }
+.adunit-card.is-selected { border-color: var(--primary); background: rgba(var(--accent-rgb),0.08); }
+.metric-value { font-family: var(--font-display); color: var(--primary); font-weight: 600; }
+.net-tab.is-active { color: var(--primary); border-bottom-color: var(--primary); }
+
+/* ---- Alerts / callouts ---- */
+.alert-warn, .default-network-note, .callout { background: rgba(var(--accent-rgb),0.08); border: 1px solid rgba(var(--accent-rgb),0.28); color: var(--on-surface-variant); border-radius: var(--radius); }
+.alert-warn { color: var(--on-surface); }
+
+/* ---- Bidding save-all button → filled M3 ---- */
+.bid-save-all { background: var(--primary); border: 1px solid var(--primary); color: var(--on-primary); border-radius: var(--radius-pill); height: 48px; }
+.bid-save-all:hover:not(:disabled) { background: var(--accent-2); border-color: var(--accent-2); box-shadow: var(--shadow-2); }
+
+/* ======================================================================
+   M3 DIALOG (replaces native confirm/alert) + SCRIM
+   ====================================================================== */
+.m3-scrim { position: fixed; inset: 0; background: var(--scrim); z-index: 10050; display: flex; align-items: center; justify-content: center; padding: 20px; opacity: 0; pointer-events: none; transition: opacity .18s ease; }
+.m3-scrim.show { opacity: 1; pointer-events: auto; }
+.m3-dialog { background: var(--surface-container-high); color: var(--on-surface); border-radius: 28px; width: min(420px, 100%); padding: 24px; box-shadow: var(--shadow-3); transform: translateY(8px) scale(0.98); transition: transform .18s ease; }
+.m3-scrim.show .m3-dialog { transform: none; }
+.m3-dialog h3 { font-family: var(--font-display); font-weight: 600; font-size: 20px; margin: 0 0 12px; color: var(--on-surface); }
+.m3-dialog p { margin: 0 0 22px; color: var(--on-surface-variant); font-size: 14px; line-height: 1.5; }
+.m3-dialog-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+
+/* ---- Push progress dialog → M3 ---- */
+#push-overlay { background: var(--scrim); z-index: 10040; }
+.push-modal { background: var(--surface-container-high); border: none; border-radius: 28px; box-shadow: var(--shadow-3); }
+.push-title { font-family: var(--font-display); font-weight: 600; color: var(--on-surface); }
+.push-count { font-family: var(--font-display); color: var(--primary); font-weight: 600; }
+.push-bar { background: var(--surface-container-highest); border: none; height: 8px; }
+.push-bar-fill { background: var(--primary); }
+
+/* ---- Snackbar → M3 (inverse surface) ---- */
+#snackbar { background: var(--inverse-surface); color: var(--inverse-on-surface); border: none; border-radius: var(--radius); box-shadow: var(--shadow-3); font-weight: 500; }
+
+@media (max-width: 720px) { .topbar { padding: 10px 14px; } .content { padding: 24px 16px 64px; } .topnav { gap: 0; } .topnav a { padding: 8px; font-size: 12.5px; } }
+
+/* ======================================================================
+   M3 REFINEMENTS · ROUND 2  (audit fixes from screenshots)
+   Fieldset/legend badges, key/value spacing, M3 selects, tables, status
+   chips, networks + bidding surfaces, existing-groups overlap. CSS only.
+   ====================================================================== */
+/* key/value rows — stop label + long value jamming together */
+.kv { gap: 16px; align-items: baseline; border-bottom-color: var(--outline-variant); }
+.kv span { color: var(--on-surface-variant); white-space: nowrap; }
+.kv b { color: var(--on-surface); text-align: right; }
+
+/* Builder steps → M3 filled cards + numbered section headers */
+.builder-step { background: var(--surface-container-low); border: 1px solid var(--outline-variant); border-radius: var(--radius-lg); box-shadow: var(--shadow-1); padding: 20px 22px; }
+.builder-step legend { display: inline-flex; align-items: center; gap: 10px; padding: 0; margin-bottom: 8px; color: var(--on-surface); font-family: var(--font-body); font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+.builder-step legend .num { display: inline-grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--primary); color: var(--on-primary); font-size: 11.5px; font-weight: 600; margin: 0; letter-spacing: 0; }
+.preview-panel { background: var(--surface-container-low); border: 1px solid var(--outline-variant); border-radius: var(--radius-lg); box-shadow: var(--shadow-1); }
+
+/* labels + radios */
+.lbl { color: var(--on-surface-variant); font-size: 12px; font-weight: 500; letter-spacing: 0.02em; }
+.radio-row label { color: var(--on-surface); }
+
+/* Native selects → M3 filled field with a proper chevron */
+select { appearance: none; -webkit-appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='20' height='20' viewBox='0 0 24 24' fill='none' stroke='%23888888' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 12px center; padding-right: 40px; }
+
+/* Tables → M3 */
+.table { background: var(--surface-container-low); border: 1px solid var(--outline-variant); box-shadow: var(--shadow-1); }
+.table th { background: var(--surface-container); color: var(--on-surface-variant); font-family: var(--font-body); font-weight: 600; text-transform: none; letter-spacing: 0.02em; font-size: 12px; }
+.table th, .table td { border-bottom-color: var(--outline-variant); }
+.table td { color: var(--on-surface); }
+.table tr:hover td { background: var(--fill-hover); }
+
+/* Status chips → M3 tonal */
+.status { border-radius: var(--radius-pill); font-family: var(--font-body); font-weight: 600; padding: 4px 12px; letter-spacing: 0.02em; font-size: 11px; text-transform: none; }
+.status-draft { color: var(--on-surface-variant); background: var(--surface-container-highest); }
+.status-generated, .status-enabled { color: var(--on-primary-container); background: var(--primary-container); }
+.status-pushed, .status-pushed_partial { color: var(--success); background: rgba(var(--good-rgb),0.18); }
+.status-disabled, .status-push_failed { color: var(--on-error-container); background: var(--error-container); }
+.pill-android, .pill-ios { border-color: transparent; background: var(--secondary-container); color: var(--on-secondary-container); }
+
+/* Networks page → M3 surfaces */
+.net-app-list, .net-app-section { background: var(--surface-container-low); border: 1px solid var(--outline-variant); box-shadow: var(--shadow-1); }
+.net-app-link { color: var(--on-surface-variant); border-radius: var(--radius); }
+.net-app-link:hover { background: var(--fill-hover); color: var(--on-surface); }
+.net-tabs { border-bottom-color: var(--outline-variant); }
+.net-form { background: var(--surface-container); border: 1px solid var(--outline-variant); }
+.net-unit-row { background: var(--surface-container-lowest); border: 1px solid var(--outline-variant); }
+.net-tab-content h4, .net-form h4 { color: var(--on-surface); font-weight: 600; }
+
+/* Bidding → M3 surfaces */
+.bid-app-pick, .bid-step-card, .bid-confirm-card, .bid-existing-card, .bid-preview-card { background: var(--surface-container-low); border: 1px solid var(--outline-variant); box-shadow: var(--shadow-1); }
+.bid-loaded-banner { background: var(--surface-container); border-color: var(--outline-variant); }
+.bid-loaded-banner.has-saved { border-color: rgba(var(--good-rgb),0.4); }
+.bid-net-form { background: var(--surface-container); border: 1px solid var(--outline-variant); }
+.bid-net-form.is-on { border-color: var(--primary); background: rgba(var(--accent-rgb),0.05); }
+.bid-fmt-section { background: var(--surface-container); border-color: var(--outline-variant); }
+.bid-fmt-section > summary:hover { background: var(--fill-hover); }
+.bid-net-grid input, .bid-net-grid select, .bid-app-label select { background: var(--surface-container-highest); border-color: var(--outline); color: var(--on-surface); }
+.bid-net-name-big, .bid-step-head h3, .bid-existing-head h3, .bid-preview-head h3, .bid-fmt-label { color: var(--on-surface); }
+.bid-step-head h3, .bid-existing-head h3, .bid-preview-head h3 { font-weight: 600; }
+/* existing-groups row — fix long format names (REWARDED_INTERSTITIAL) overlapping the value */
+.bid-existing-row { grid-template-columns: minmax(160px, max-content) 1fr; column-gap: 20px; background: var(--surface-container); border-color: var(--outline-variant); }
+.bid-existing-row.has-groups { border-color: rgba(var(--good-rgb),0.4); }
+.bid-existing-fmt { white-space: nowrap; color: var(--on-surface); }
+.bid-section-badge, .bid-count { background: var(--surface-container-highest); color: var(--on-surface-variant); border-color: transparent; }
+.bid-count.is-on { background: var(--primary-container); color: var(--on-primary-container); border-color: transparent; }
+.bid-db-info code, .bid-loaded-pill.bid-loaded-empty { background: var(--surface-container-highest); }
+.bid-loaded-pill { background: rgba(var(--good-rgb),0.16); color: var(--success); border-color: transparent; }
+.bid-confirm { background: rgba(var(--accent-rgb),0.06); border-color: rgba(var(--accent-rgb),0.28); }
+.bid-preview-json, .calc-explainer, .forensic-block { background: var(--surface-container-highest); border-color: var(--outline-variant); color: var(--on-surface-variant); }
+
+/* metric + report + line-table surfaces */
+.metric { background: var(--surface-container); border-color: var(--outline-variant); }
+.report-card { background: var(--surface-container-low); border-color: var(--outline-variant); box-shadow: var(--shadow-1); }
+.line-table, .line-table-head, .line-table-row { border-color: var(--outline-variant); }
+.line-table-head { background: var(--surface-container); color: var(--on-surface-variant); }
+.empty { background: var(--surface-container-low); border-color: var(--outline-variant); }
+
+/* ======================================================================
+   DASHBOARD · account dropdown + charts (M3)
+   ====================================================================== */
+.grid-4 { grid-template-columns: repeat(4, 1fr); }
+@media (max-width: 900px) { .grid-4 { grid-template-columns: repeat(2, 1fr); } }
+@media (max-width: 520px) { .grid-4 { grid-template-columns: 1fr; } }
+.stat-row { margin-bottom: 18px; }
+.acct-card { margin: 0 0 20px; }
+.acct-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 12px; }
+.acct-single { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+
+/* M3 dropdown menu (details/summary popover) */
+.m3-menu { position: relative; }
+.m3-menu > summary { list-style: none; cursor: pointer; }
+.m3-menu > summary::-webkit-details-marker { display: none; }
+.m3-menu-btn { display: inline-flex; align-items: center; gap: 10px; min-width: 200px; justify-content: space-between; padding: 10px 16px; border-radius: var(--radius-pill); border: 1px solid var(--outline); background: var(--surface-container-highest); color: var(--on-surface); font-size: 14px; font-weight: 500; }
+.m3-menu-btn:hover { background: var(--surface-container-high); }
+.m3-menu[open] .chev { transform: rotate(180deg); }
+.m3-menu .chev { transition: transform .15s ease; color: var(--on-surface-variant); }
+.m3-menu-list { position: absolute; right: 0; top: calc(100% + 6px); z-index: 30; width: 300px; max-width: 86vw; background: var(--surface-container-high); border: 1px solid var(--outline-variant); border-radius: 12px; box-shadow: var(--shadow-3); padding: 10px; max-height: 340px; overflow-y: auto; }
+.m3-menu-list input[type="text"] { width: 100%; margin-bottom: 8px; }
+.m3-menu-item { display: flex; align-items: center; gap: 12px; padding: 10px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px; color: var(--on-surface); }
+.m3-menu-item:hover { background: var(--fill-hover); }
+.m3-menu-item input { accent-color: var(--primary); width: 16px; height: 16px; }
+.m3-menu-item > span:nth-child(2) { flex: 1; font-family: var(--font-mono); font-size: 12.5px; }
+
+/* Bar charts */
+.dash-charts { margin: 4px 0 24px; align-items: start; }
+.chart-card { padding: 20px 22px; }
+.bar-chart { display: flex; flex-direction: column; gap: 12px; margin-top: 14px; }
+.bar-row { display: grid; grid-template-columns: 130px 1fr 34px; align-items: center; gap: 12px; }
+.bar-label { font-size: 12.5px; color: var(--on-surface-variant); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.bar-track { height: 10px; background: var(--surface-container-highest); border-radius: var(--radius-pill); overflow: hidden; }
+.bar-fill { display: block; height: 100%; background: var(--primary); border-radius: var(--radius-pill); transition: width .4s ease; min-width: 4px; }
+.bar-val { font-size: 13px; font-weight: 600; color: var(--on-surface); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* Push status split bar */
+.status-split { display: flex; gap: 4px; height: 26px; margin-top: 12px; }
+.split-seg { display: grid; place-items: center; border-radius: 6px; min-width: 26px; color: #fff; font-size: 12px; font-weight: 600; }
+.split-seg:only-child, .split-seg span { pointer-events: none; }
+.split-pushed { background: var(--success); }
+.split-draft { background: var(--surface-container-highest); color: var(--on-surface-variant); }
+.split-seg[style*="flex:0"] { display: none; }
+.split-legend { display: flex; gap: 18px; margin-top: 10px; font-size: 12.5px; color: var(--on-surface-variant); }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; }
+.dot-pushed { background: var(--success); }
+.dot-draft { background: var(--outline); }
+
+/* ======================================================================
+   M3 form controls — checkboxes, radios, correct color-scheme
+   ====================================================================== */
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--primary); width: 18px; height: 18px; cursor: pointer; flex: none; }
+/* labels that wrap a checkbox/radio must lay out in a ROW (the global
+   `label{flex-direction:column}` was stacking the box above its text) */
+label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) { flex-direction: row; align-items: center; gap: 10px; }
+.bid-confirm { align-items: flex-start; }
+/* table checkboxes stay centered in their cell */
+.table td input[type="checkbox"] { margin: 0; }
+
+/* ======================================================================
+   M3 tables — vertical alignment, sane wrapping, tidy headers
+   ====================================================================== */
+.table { table-layout: auto; }
+.table th, .table td { vertical-align: middle; }
+.table th { white-space: nowrap; }
+.table td { word-break: normal; overflow-wrap: anywhere; }
+/* long monospace IDs (app id / store id / ad unit id) wrap cleanly instead
+   of forcing a column to blow up and squash the others */
+.table td.mono, .table .mono { word-break: break-all; font-size: 12.5px; color: var(--on-surface-variant); }
+/* the trailing action link ("Open →", "Manage →") never wraps */
+.table td:last-child { white-space: nowrap; }
+.table td:last-child a { white-space: nowrap; }
+.table tr td { line-height: 1.45; }
+
+/* headings — a touch more air above the title so the overline isn't cramped */
+.page-head { margin-bottom: 30px; }
+.page-head .eyebrow { margin-bottom: 10px; }
+.content { padding-top: 40px; }
+.row-between.page-head { align-items: flex-start; }
+
+/* Builder step header — plain div (previously a fieldset legend that pierced
+   the card's top border). Card border now stays fully intact. */
+.builder-legend { display: flex; align-items: center; gap: 10px; margin: 0 0 16px; color: var(--on-surface); font-family: var(--font-body); font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
 """
 
 
@@ -4284,8 +4737,50 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 CHANGELOG = [
+    {
+        "version": "1.3",
+        "date": "2026-07-13",
+        "title": "Material 3 redesign — cleaner, clearer, easier",
+        "changes": [
+            "Complete visual overhaul built on Google's Material 3 (Material You) "
+            "design system — a cleaner, more modern, and more consistent interface "
+            "across every screen.",
+            "Light and dark mode: a new theme toggle (🌙 / ☀️) in the top bar lets "
+            "you switch instantly. Your choice is remembered on this device, and the "
+            "app opens in light mode by default.",
+            "New professional-blue colour theme with proper Material tonal surfaces, "
+            "so buttons, selected states, and highlights all feel consistent.",
+            "Cards are now clean, white, elevated surfaces that float above a softly "
+            "tinted background — content is much easier to scan.",
+            "Refreshed typography using Google's Roboto font for a crisp, readable "
+            "look throughout.",
+            "The sign-in screen now shows the official multi-colour Google logo on "
+            "the 'Continue with Google' button.",
+            "Redesigned Dashboard with at-a-glance charts: mediation groups by "
+            "format, apps by platform, and a push-status bar (how many groups are "
+            "live in AdMob vs. still draft), plus a new 'Ad units' count card.",
+            "Multiple AdMob accounts are now handled with a clean dropdown menu "
+            "(search + checkboxes) instead of a row of chips — pick which accounts' "
+            "apps appear in the Builder.",
+            "All on-screen text rewritten in plain, friendly English — long, "
+            "technical descriptions replaced with short, easy-to-understand wording "
+            "on the login, dashboard, builder, networks, bidding, and cleanup pages.",
+            "Buttons, form fields, dropdowns, checkboxes, radio buttons, dialogs, "
+            "tables, and status chips all restyled to Material 3 standards.",
+            "Pop-up confirmations replaced with clean Material dialogs (no more "
+            "plain browser alerts).",
+            "Bidding network keys and IDs (App Key, SDK Key) are now shown as plain "
+            "text instead of hidden dots, so you can read and verify them.",
+            "Many layout fixes: table columns and text now align correctly, long IDs "
+            "wrap cleanly, section headings no longer overlap card borders, and the "
+            "selected-app label reads clearly.",
+            "No change to how mediation groups, tier ad units, or bidding mappings "
+            "are created in AdMob — this release is purely about the look, wording, "
+            "and ease of use.",
+        ],
+    },
     {
         "version": "1.2",
         "date": "2026-07-07",
@@ -4676,13 +5171,39 @@ def dashboard(request: Request, db: Session = Depends(get_db), user: User = Depe
             api_error = str(e)
     apps = db.query(AdMobApp).filter(AdMobApp.user_id == user.id).all()
     app_count = len(apps)
-    group_count = db.query(MediationGroup).filter(MediationGroup.user_id == user.id).count()
+    groups = db.query(MediationGroup).filter(MediationGroup.user_id == user.id).all()
+    group_count = len(groups)
     accounts = _accounts_from_apps(apps)
+
+    # ---- Lightweight stats for the dashboard charts (computed from cache) ----
+    from collections import Counter
+    plat_counts = Counter((a.platform or "OTHER").upper() for a in apps)
+    fmt_counts = Counter((g.ad_format or "OTHER").upper() for g in groups)
+    status_counts = Counter((g.status or "DRAFT").upper() for g in groups)
+    adunit_count = sum(len(a.ad_units) for a in apps)
+    pushed = status_counts.get("PUSHED", 0) + status_counts.get("PUSHED_PARTIAL", 0)
+
+    def _bars(counter, order=None):
+        items = ([(k, counter.get(k, 0)) for k in order if counter.get(k, 0)]
+                 if order else sorted(counter.items(), key=lambda x: -x[1]))
+        top = max([v for _, v in items], default=0)
+        return [{"label": k, "value": v,
+                 "pct": round(100 * v / top) if top else 0} for k, v in items]
+
+    stats = {
+        "platforms": _bars(plat_counts),
+        "formats": _bars(fmt_counts, order=[
+            "BANNER", "INTERSTITIAL", "REWARDED", "REWARDED_INTERSTITIAL",
+            "NATIVE", "APP_OPEN"]),
+        "adunit_count": adunit_count,
+        "pushed": pushed,
+        "draft": group_count - pushed,
+    }
     return tmpl(request).TemplateResponse("dashboard.html", {
         "request": request, "user": user,
         "publisher_id": publisher_id or "(not detected - click Sync Apps)",
         "app_count": app_count, "group_count": group_count, "api_error": api_error,
-        "accounts": accounts,
+        "accounts": accounts, "stats": stats,
         "max_lines": WATERFALL_MAX_LINES,
     })
 

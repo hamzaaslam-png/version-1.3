@@ -3,22 +3,34 @@
 {% block content %}
 <section class="page-head"><p class="eyebrow">Dashboard</p><h1 class="display">Welcome, {{ user.name or user.email }}.</h1></section>
 {% if api_error %}<div class="alert alert-warn"><strong>AdMob API:</strong> {{ api_error }}</div>{% endif %}
-<section class="grid grid-3">
-  <article class="card"><p class="card-label">Publisher ID</p><p class="card-value mono">{{ publisher_id }}</p></article>
+<section class="grid grid-4 stat-row">
+  <article class="card"><p class="card-label">Publisher ID</p><p class="card-value mono" style="font-size:15px">{{ publisher_id }}</p></article>
   <article class="card"><p class="card-label">Cached apps</p><p class="card-value">{{ app_count }}</p><a class="card-link" href="/apps">Manage →</a></article>
+  <article class="card"><p class="card-label">Ad units</p><p class="card-value">{{ stats.adunit_count }}</p></article>
   <article class="card"><p class="card-label">Mediation groups</p><p class="card-value">{{ group_count }}</p><a class="card-link" href="/mediation">Open →</a></article>
 </section>
 {% if accounts %}
-<section class="card" style="margin:8px 0 20px">
-  <p class="card-label">AdMob Account{% if accounts|length > 1 %} <span class="muted small">(applies in Builder)</span>{% endif %}</p>
-  {% if accounts|length > 1 %}<input type="text" id="acct-search" placeholder="Search accounts…" style="margin:8px 0;max-width:320px" />{% endif %}
-  <div id="acct-chips" class="country-chips"></div>
-  {% if accounts|length > 1 %}
-  <p class="muted small">Applies in the Builder. Add more via admob.google.com → Sync.</p>
+<section class="card acct-card">
+  <div class="acct-head">
+    <p class="card-label" style="margin:0">AdMob account{% if accounts|length > 1 %} <span class="muted small">· used in the Builder</span>{% endif %}</p>
+    {% if accounts|length > 1 %}
+    <details class="m3-menu" id="acct-menu">
+      <summary class="m3-menu-btn"><span id="acct-summary">All accounts</span><span class="chev">▾</span></summary>
+      <div class="m3-menu-list">
+        <input type="text" id="acct-search" placeholder="Search accounts…" />
+        <div id="acct-options"></div>
+      </div>
+    </details>
+    {% endif %}
+  </div>
+  {% if accounts|length == 1 %}
+  <div class="acct-single"><span class="country-chip is-selected">{{ accounts[0].publisher }}</span><span class="muted small">{{ accounts[0].app_count }} app{{ '' if accounts[0].app_count == 1 else 's' }}</span></div>
+  <p class="muted small" style="margin-bottom:0">Have another account? Add it on admob.google.com, then <a href="/apps">Sync</a>.</p>
   {% else %}
-  <p class="muted small">Add another account on admob.google.com → <a href="/apps">Sync</a>.</p>
+  <p class="muted small" style="margin-bottom:0">Choose which accounts' apps appear in the Builder.</p>
   {% endif %}
 </section>
+{% if accounts|length > 1 %}
 <script>
 (function(){
   const ACCOUNTS = {{ accounts|tojson }};
@@ -28,30 +40,82 @@
   sel = new Set([...sel].filter(p=>valid.has(p)));
   if (sel.size===0) ACCOUNTS.forEach(a=>sel.add(a.publisher));
   function save(){ try{ localStorage.setItem("selectedPublishers", JSON.stringify([...sel])); }catch(e){} }
+  function summary(){
+    const s = document.getElementById("acct-summary");
+    if (!s) return;
+    if (sel.size === ACCOUNTS.length) s.textContent = "All accounts (" + ACCOUNTS.length + ")";
+    else if (sel.size === 1) s.textContent = [...sel][0];
+    else s.textContent = sel.size + " accounts selected";
+  }
   function render(){
-    const wrap = document.getElementById("acct-chips");
+    const wrap = document.getElementById("acct-options");
     const se = document.getElementById("acct-search");
     const f = ((se ? se.value : "")||"").toLowerCase();
     wrap.innerHTML = "";
     ACCOUNTS.filter(a => !f || a.publisher.toLowerCase().includes(f)).forEach(a => {
       const on = sel.has(a.publisher);
-      const chip = document.createElement("button");
-      chip.type = "button";
-      chip.className = "country-chip" + (on ? " is-selected" : "");
-      chip.textContent = `${a.publisher} (${a.app_count})`;
-      chip.addEventListener("click", () => {
-        if (on) sel.delete(a.publisher); else sel.add(a.publisher);
+      const item = document.createElement("label");
+      item.className = "m3-menu-item";
+      const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = on;
+      const name = document.createElement("span"); name.textContent = a.publisher;
+      const cnt = document.createElement("span"); cnt.className = "muted small"; cnt.textContent = a.app_count;
+      cb.addEventListener("change", () => {
+        if (sel.has(a.publisher)) sel.delete(a.publisher); else sel.add(a.publisher);
         if (sel.size===0) ACCOUNTS.forEach(x=>sel.add(x.publisher));
-        save(); render();
+        save(); summary(); render();
       });
-      wrap.appendChild(chip);
+      item.appendChild(cb); item.appendChild(name); item.appendChild(cnt);
+      wrap.appendChild(item);
     });
   }
-  const __s = document.getElementById("acct-search");
-  if (__s) __s.addEventListener("input", render);
-  save(); render();
+  const se = document.getElementById("acct-search");
+  if (se) se.addEventListener("input", render);
+  save(); summary(); render();
 })();
 </script>
+{% endif %}
+{% endif %}
+
+{% if group_count or app_count %}
+<section class="dash-charts grid grid-2">
+  <div class="card chart-card">
+    <p class="card-label">Mediation groups by format</p>
+    {% if stats.formats %}
+    <div class="bar-chart">
+      {% for b in stats.formats %}
+      <div class="bar-row">
+        <span class="bar-label">{{ b.label|replace('_',' ')|title }}</span>
+        <span class="bar-track"><span class="bar-fill" style="width:{{ b.pct }}%"></span></span>
+        <span class="bar-val">{{ b.value }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="muted small">No mediation groups yet. Open the Builder to create your first one.</p>{% endif %}
+  </div>
+  <div class="card chart-card">
+    <p class="card-label">Apps by platform</p>
+    {% if stats.platforms %}
+    <div class="bar-chart">
+      {% for b in stats.platforms %}
+      <div class="bar-row">
+        <span class="bar-label">{{ b.label|title }}</span>
+        <span class="bar-track"><span class="bar-fill" style="width:{{ b.pct }}%"></span></span>
+        <span class="bar-val">{{ b.value }}</span>
+      </div>
+      {% endfor %}
+    </div>
+    {% else %}<p class="muted small">No apps synced yet.</p>{% endif %}
+    <p class="card-label" style="margin-top:20px">Push status</p>
+    <div class="status-split">
+      <div class="split-seg split-pushed" style="flex:{{ stats.pushed or 0 }}"><span>{{ stats.pushed }}</span></div>
+      <div class="split-seg split-draft" style="flex:{{ stats.draft or 0 }}"><span>{{ stats.draft }}</span></div>
+    </div>
+    <div class="split-legend">
+      <span><i class="dot dot-pushed"></i> {{ stats.pushed }} live in AdMob</span>
+      <span><i class="dot dot-draft"></i> {{ stats.draft }} draft</span>
+    </div>
+  </div>
+</section>
 {% endif %}
 <section class="cta-row">
   <a class="btn-primary" href="/mediation/builder">▶ Open Mediation Builder</a>
@@ -59,18 +123,18 @@
   <a class="btn-danger" href="/cleanup">🗑 Delete Ad Units &amp; Groups</a>
 </section>
 <section class="workflow">
-  <h2 class="section-title">How the waterfall builder works</h2>
+  <h2 class="section-title">How it works</h2>
   <ol class="workflow-steps">
     <li><span class="step-no">01</span><span class="step-text">Sign in <span class="done">✓</span></span></li>
-    <li><span class="step-no">02</span><span class="step-text">Sync your AdMob apps &amp; ad units <a href="/apps">→ Apps</a></span></li>
+    <li><span class="step-no">02</span><span class="step-text">Sync your apps &amp; ad units <a href="/apps">→ Apps</a></span></li>
     <li><span class="step-no">03</span><span class="step-text">Open the Builder <a href="/mediation/builder">→ Builder</a></span></li>
-    <li><span class="step-no">04</span><span class="step-text">Select an app + one or more source ad units</span></li>
-    <li><span class="step-no">05</span><span class="step-text">Choose country targeting (Global / Choose / Exclude)</span></li>
-    <li><span class="step-no">06</span><span class="step-text">Set waterfall depth (1–{{ max_lines }}) + floor type</span></li>
-    <li><span class="step-no">07</span><span class="step-text">Fetch live AdMob report (last 7 days)</span></li>
-    <li><span class="step-no">08</span><span class="step-text">Review/edit the calculated tier eCPM values</span></li>
-    <li><span class="step-no">09</span><span class="step-text"><strong>Push to AdMob:</strong> For each source ad unit: (a) create N labeled tier ad units, (b) replicate every bidding mapping (Meta/AppLovin/etc.) from the source onto every tier, (c) create ONE mediation group targeting source + all tiers, with N MANUAL AdMob Network waterfall lines + AdMob Network LIVE bidding line (plus a LIVE line per replicated 3P network).</span></li>
-    <li><span class="step-no">10</span><span class="step-text">Tool reads the group back and audits every line's state. Disabled lines are surfaced as errors.</span></li>
+    <li><span class="step-no">04</span><span class="step-text">Pick an app and one or more ad units</span></li>
+    <li><span class="step-no">05</span><span class="step-text">Choose which countries to target</span></li>
+    <li><span class="step-no">06</span><span class="step-text">Set how many waterfall tiers you want (1–{{ max_lines }})</span></li>
+    <li><span class="step-no">07</span><span class="step-text">Fetch live earnings from AdMob (last 7 days)</span></li>
+    <li><span class="step-no">08</span><span class="step-text">Review the tier eCPM values Flow calculated</span></li>
+    <li><span class="step-no">09</span><span class="step-text">Push — Flow builds the tier ad units and mediation groups in AdMob for you</span></li>
+    <li><span class="step-no">10</span><span class="step-text">Flow double-checks every line and flags anything disabled</span></li>
   </ol>
 </section>
 {% endblock %}

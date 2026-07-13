@@ -4,7 +4,7 @@
 <section class="page-head">
   <p class="eyebrow">Builder</p>
   <h1 class="display">Mediation builder</h1>
-  <p class="lede">Pick app + source ad units → choose targeting → fetch live AdMob report → push creates <strong>N tier ad units, replicated bidding mappings, and ONE mediation group per source ad unit</strong>. AdMob Network is the default — present even when no third-party bidding networks are configured.</p>
+  <p class="lede">Pick an app and its ad units, choose who to target, and fetch live earnings. Flow then calculates the waterfall and builds it in AdMob for you.</p>
 </section>
 
 {% if not apps %}
@@ -16,23 +16,23 @@
 
 <div class="builder-grid">
   <div>
-    <fieldset class="builder-step" id="account-step" style="display:none">
-      <legend><span class="num">00</span> AdMob Account</legend>
+    <div class="builder-step" id="account-step" style="display:none">
+      <div class="builder-legend"><span class="num">00</span> AdMob Account</div>
       <input type="text" id="account-search" placeholder="Search accounts…" />
       <div id="account-list" class="country-chips" style="margin-top:8px"></div>
-      <p class="muted small">Choose one or more AdMob accounts — only their apps appear below. To add a new account: sign into it on admob.google.com → <a href="/apps">Sync</a>.</p>
-    </fieldset>
+      <p class="muted small">Only the selected accounts' apps show up below.</p>
+    </div>
 
-    <fieldset class="builder-step">
-      <legend><span class="num">01</span> Select App</legend>
+    <div class="builder-step">
+      <div class="builder-legend"><span class="num">01</span> Select App</div>
       <input type="text" id="app-search" placeholder="Search apps by name or ID…" style="margin-bottom:8px" />
       <select id="app-select">
         <option value="">— Choose an app —</option>
       </select>
-    </fieldset>
+    </div>
 
-    <fieldset class="builder-step" id="adunit-step" style="display:none">
-      <legend><span class="num">02</span> Select Source Ad Units</legend>
+    <div class="builder-step" id="adunit-step" style="display:none">
+      <div class="builder-legend"><span class="num">02</span> Select Source Ad Units</div>
       <div class="row-between" style="margin-bottom:10px">
         <input type="text" id="adunit-search" placeholder="Filter ad units…" />
         <div>
@@ -41,14 +41,14 @@
         </div>
       </div>
       <div id="adunit-list" class="adunit-cards"></div>
-    </fieldset>
+    </div>
 
-    <fieldset class="builder-step">
-      <legend><span class="num">03</span> Country Targeting</legend>
+    <div class="builder-step">
+      <div class="builder-legend"><span class="num">03</span> Country Targeting</div>
       <div class="radio-row">
         <label><input type="radio" name="country_mode" value="GLOBAL" checked /> <span><b>Global</b> — target all countries</span></label>
         <label><input type="radio" name="country_mode" value="INCLUDE" /> <span><b>Choose</b> specific countries</span></label>
-        <label><input type="radio" name="country_mode" value="EXCLUDE" /> <span><b>Exclude</b> specific countries (stored locally; AdMob API has no exclude field)</span></label>
+        <label><input type="radio" name="country_mode" value="EXCLUDE" /> <span><b>Exclude</b> specific countries</span></label>
       </div>
       <div id="country-picker" style="display:none">
         <input type="text" id="country-search" placeholder="Search countries…" />
@@ -56,10 +56,10 @@
         <p class="muted small">Or paste comma-separated ISO-2 codes:</p>
         <input type="text" id="country-paste" placeholder="US, GB, DE, JP" />
       </div>
-    </fieldset>
+    </div>
 
-    <fieldset class="builder-step">
-      <legend><span class="num">04</span> Waterfall &amp; Bidding</legend>
+    <div class="builder-step">
+      <div class="builder-legend"><span class="num">04</span> Waterfall &amp; Bidding</div>
       <div class="grid grid-2">
         <label><span class="lbl">Number of waterfall lines (1–{{ max_lines }})</span>
           <input type="number" id="line-count" min="1" max="{{ max_lines }}" value="{{ default_lines }}" /></label>
@@ -70,8 +70,8 @@
       <div class="bidding-callout" id="bidding-callout">
         <div class="bidding-callout-head">
           <div>
-            <strong>⚡ Include All Bidding Networks</strong>
-            <p class="muted small" style="margin:4px 0 0">When ON, all enabled 3P bidding networks saved on <a href="/bidding">/bidding</a> (for this app + format) become LIVE bidding lines in the mediation group. When OFF, only the default AdMob Network LIVE line is added.</p>
+            <strong>⚡ Include all bidding networks</strong>
+            <p class="muted small" style="margin:4px 0 0">On: add every bidding network you've set up on <a href="/bidding">Bidding</a> for this app. Off: use AdMob Network only.</p>
           </div>
           <label class="bidding-toggle">
             <input type="checkbox" id="include-bidding" checked />
@@ -79,7 +79,7 @@
           </label>
         </div>
       </div>
-    </fieldset>
+    </div>
 
     <div class="report-source" style="margin:4px 0 14px">
       <span class="lbl" style="display:block;margin-bottom:6px">eCPM source</span>
@@ -133,8 +133,8 @@
     <span class="muted small">Every tier value is clamped to <b>${{ min_ecpm }}</b> – <b>${{ max_ecpm|int }}</b>.</span>
   </div>
   <div class="form-actions">
-    <button class="btn-primary btn-lg" id="push-btn">▶ Create mediation group + waterfall + bidding</button>
-    <button class="btn-secondary btn-lg" id="generate-btn">Save locally only (preview/draft)</button>
+    <button class="btn-primary btn-lg" id="push-btn">▶ Push to AdMob</button>
+    <button class="btn-secondary btn-lg" id="generate-btn">Save as draft</button>
   </div>
 
   <hr style="margin: 32px 0; border: 0; border-top: 1px solid var(--line)" />

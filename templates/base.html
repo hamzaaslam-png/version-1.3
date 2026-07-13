@@ -4,9 +4,17 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}Flow{% endblock %}</title>
+  <meta name="color-scheme" content="light dark">
+  <script>
+    // Set theme before first paint to avoid a flash. Default = light.
+    (function(){ try {
+      var t = localStorage.getItem("flow-theme") || "light";
+      document.documentElement.setAttribute("data-theme", t);
+    } catch(e){ document.documentElement.setAttribute("data-theme","light"); } })();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,600&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -25,9 +33,59 @@
         <span class="user-chip">{% if user.picture %}<img src="{{ user.picture }}" alt="" />{% endif %}<span>{{ user.email }}</span></span>
         <a href="/auth/logout" class="logout">Sign out</a>
       {% endif %}
+      <button type="button" class="theme-toggle" id="theme-toggle" title="Toggle light / dark" aria-label="Toggle light or dark theme"><span class="icon-light">🌙</span><span class="icon-dark">☀️</span></button>
     </nav>
   </header>
   <main class="content">{% block content %}{% endblock %}</main>
-  <footer class="footer"><span>Flow</span><span class="footer-sep">·</span><a href="/changelog" class="footer-version" title="What's new — click for the changelog">v{{ app_version }}</a><span class="footer-sep">·</span><span>1 group per source · Tier ad units · Replicated bidding mappings · Live audit</span></footer>
+  <footer class="footer"><span>Flow</span><span class="footer-sep">·</span><a href="/changelog" class="footer-version" title="What's new — click for the changelog">v{{ app_version }}</a><span class="footer-sep">·</span><span>Build AdMob mediation waterfalls in a few clicks.</span></footer>
+  <script>
+    // ---- Theme toggle (persisted) ----
+    (function(){
+      var btn = document.getElementById("theme-toggle");
+      if (!btn) return;
+      btn.addEventListener("click", function(){
+        var cur = document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+        var next = cur === "dark" ? "light" : "dark";
+        document.documentElement.setAttribute("data-theme", next);
+        try { localStorage.setItem("flow-theme", next); } catch(e){}
+      });
+    })();
+    // ---- M3 dialog helper: window.m3confirm(opts) -> Promise<bool> ----
+    // Clean replacement for native confirm()/alert(). Usage:
+    //   m3confirm({title, message, confirmText, danger}).then(ok => { ... })
+    window.m3confirm = function(opts){
+      opts = opts || {};
+      return new Promise(function(resolve){
+        var scrim = document.createElement("div");
+        scrim.className = "m3-scrim";
+        var confirmText = opts.confirmText || "Confirm";
+        var cancelText = opts.cancelText || "Cancel";
+        var confirmCls = opts.danger ? "btn-danger" : "btn-primary";
+        var d = document.createElement("div");
+        d.className = "m3-dialog";
+        d.setAttribute("role","dialog"); d.setAttribute("aria-modal","true");
+        var h = document.createElement("h3"); h.textContent = opts.title || "Are you sure?";
+        var p = document.createElement("p"); p.textContent = opts.message || "";
+        var acts = document.createElement("div"); acts.className = "m3-dialog-actions";
+        d.appendChild(h); if (opts.message) d.appendChild(p); d.appendChild(acts);
+        function close(val){ scrim.classList.remove("show"); setTimeout(function(){ scrim.remove(); }, 200); resolve(val); }
+        if (!opts.alert){
+          var cancel = document.createElement("button");
+          cancel.type = "button"; cancel.className = "btn-ghost"; cancel.textContent = cancelText;
+          cancel.addEventListener("click", function(){ close(false); });
+          acts.appendChild(cancel);
+        }
+        var ok = document.createElement("button");
+        ok.type = "button"; ok.className = confirmCls; ok.textContent = opts.alert ? (opts.confirmText || "OK") : confirmText;
+        ok.addEventListener("click", function(){ close(true); });
+        acts.appendChild(ok);
+        scrim.appendChild(d); document.body.appendChild(scrim);
+        scrim.addEventListener("click", function(e){ if (e.target === scrim && !opts.alert) close(false); });
+        requestAnimationFrame(function(){ scrim.classList.add("show"); ok.focus(); });
+      });
+    };
+    // Convenience alert-style toast/dialog
+    window.m3alert = function(message, title){ return window.m3confirm({title: title || "Notice", message: message, alert: true, confirmText: "OK"}); };
+  </script>
 </body>
 </html>
