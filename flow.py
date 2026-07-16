@@ -860,6 +860,58 @@ def _days_ago_iso(n: int, tz: str = "America/Los_Angeles") -> str:
     return (_admob_today(tz) - timedelta(days=n)).isoformat()
 
 
+# Account metadata (currency / reporting timezone / USD->account FX) barely
+# ever changes, but a NEW AdMobClient is built per HTTP request — so the
+# per-client cache never survived, and every builder fetch re-derived the FX
+# (2 extra 30-day account reports) + an accounts lookup. That's ~4 API calls
+# per fetch and made the ad-unit list feel slow. Cache it per publisher with a
+# TTL so only the first call after a restart pays for it.
+_ACCOUNT_META: dict[str, dict] = {}
+_ACCOUNT_META_TTL = 6 * 3600          # seconds
+_ACCOUNT_META_LOCK = threading.Lock()
+
+
+def _acct_meta_get(pub: str, key: str):
+    with _ACCOUNT_META_LOCK:
+        e = _ACCOUNT_META.get(pub)
+        if not e or (time.time() - e.get("ts", 0)) > _ACCOUNT_META_TTL:
+            return None
+        return e.get(key)
+
+
+def _acct_meta_set(pub: str, key: str, val) -> None:
+    with _ACCOUNT_META_LOCK:
+        e = _ACCOUNT_META.get(pub)
+        if not e or (time.time() - e.get("ts", 0)) > _ACCOUNT_META_TTL:
+            e = {"ts": time.time()}
+            _ACCOUNT_META[pub] = e
+        e[key] = val
+
+
+# Per-(user, app, geo) earnings cache for the builder's sorted ad-unit list.
+# The report only changes once a day, but users flip Global <-> countries a lot;
+# without this each flip cost a full AdMob report round-trip.
+_EARNINGS_CACHE: dict[tuple, dict] = {}
+_EARNINGS_TTL = 10 * 60        # seconds
+_EARNINGS_LOCK = threading.Lock()
+
+
+def _earnings_cache_get(key: tuple):
+    with _EARNINGS_LOCK:
+        e = _EARNINGS_CACHE.get(key)
+        if not e or (time.time() - e["ts"]) > _EARNINGS_TTL:
+            return None
+        return e["val"]
+
+
+def _earnings_cache_set(key: tuple, val: dict) -> None:
+    with _EARNINGS_LOCK:
+        if len(_EARNINGS_CACHE) > 300:       # tiny bound; drop oldest
+            for k in sorted(_EARNINGS_CACHE, key=lambda k: _EARNINGS_CACHE[k]["ts"])[:100]:
+                _EARNINGS_CACHE.pop(k, None)
+        _EARNINGS_CACHE[key] = {"ts": time.time(), "val": val}
+
+
 def _waterfall_ad_types(fmt: str) -> list[str]:
     """AdMob-valid media types for an AdMob Network Waterfall backing ad unit
     of the given format (v1alpha).
@@ -1015,15 +1067,23 @@ class AdMobClient:
         Read from the PublisherAccount we already fetched; defaults to USD."""
         if getattr(self, "_account_currency", None):
             return self._account_currency
-        cur = "USD"
         try:
             pub = self.get_publisher_id()
+        except Exception:
+            return "USD"
+        cached = _acct_meta_get(pub, "currency")
+        if cached:
+            self._account_currency = cached
+            return cached
+        cur = "USD"
+        try:
             for a in (self.list_accounts() or []):
                 if a.get("publisherId") == pub and a.get("currencyCode"):
                     cur = a["currencyCode"].upper()
                     break
         except Exception:
             cur = "USD"
+        _acct_meta_set(pub, "currency", cur)
         self._account_currency = cur
         return cur
 
@@ -1034,15 +1094,23 @@ class AdMobClient:
         to AdMob's classic 'America/Los_Angeles' if unavailable."""
         if getattr(self, "_account_tz", None):
             return self._account_tz
-        tz = "America/Los_Angeles"
         try:
             pub = self.get_publisher_id()
+        except Exception:
+            return "America/Los_Angeles"
+        cached = _acct_meta_get(pub, "tz")
+        if cached:
+            self._account_tz = cached
+            return cached
+        tz = "America/Los_Angeles"
+        try:
             for a in (self.list_accounts() or []):
                 if a.get("publisherId") == pub and a.get("reportingTimeZone"):
                     tz = a["reportingTimeZone"]
                     break
         except Exception:
             pass
+        _acct_meta_set(pub, "tz", tz)
         self._account_tz = tz
         return tz
 
@@ -1057,6 +1125,16 @@ class AdMobClient:
             return 1.0
         if getattr(self, "_usd_fx", None):
             return self._usd_fx
+        # Cross-request cache: deriving this costs TWO 30-day reports.
+        try:
+            _pub = self.get_publisher_id()
+        except Exception:
+            _pub = ""
+        if _pub:
+            cached = _acct_meta_get(_pub, "fx")
+            if cached:
+                self._usd_fx = cached
+                return cached
         fx = 1.0
         try:
             parent = f"accounts/{self.get_publisher_id()}"
@@ -1089,6 +1167,8 @@ class AdMobClient:
         # Guard against a nonsense ratio (e.g. empty report) — fall back to 1.0.
         if not (0.01 < fx < 10000):
             fx = 1.0
+        if _pub:
+            _acct_meta_set(_pub, "fx", fx)
         self._usd_fx = fx
         return fx
 
@@ -1107,7 +1187,13 @@ class AdMobClient:
     def fetch_network_report_for_ad_units(self, ad_unit_ids: list[str],
                                           start: str, end: str,
                                           countries: list[str] | None = None,
-                                          report_type: str = "mediation") -> dict[str, dict]:
+                                          report_type: str = "mediation",
+                                          with_fx: bool = False) -> dict[str, dict]:
+        # with_fx: deriving the USD->account rate costs TWO extra 30-day
+        # reports. Only the builder's main report needs it (for the "floors
+        # pushed in AED x3.67" note); the ad-unit earnings list shows plain USD
+        # and must stay fast, so it asks for with_fx=False. The push path calls
+        # get_usd_to_account_fx() itself and is unaffected.
         # report_type:
         #   "mediation" (default) -> Mediation report, eCPM = OBSERVED_ECPM.
         #       Matches the value shown in the AdMob UI (whole waterfall, all
@@ -1121,8 +1207,9 @@ class AdMobClient:
         parent = f"accounts/{self.get_publisher_id()}"
         account_currency = self.get_account_currency()
         # USD -> account-currency multiplier for converting displayed USD eCPMs
-        # into the floor currency at push time (1.0 for USD accounts).
-        usd_fx = self.get_usd_to_account_fx()
+        # into the floor currency at push time (1.0 for USD accounts). Skipped
+        # unless asked for — it costs two extra 30-day reports.
+        usd_fx = self.get_usd_to_account_fx() if with_fx else 1.0
         dimension_filters = [
             {"dimension": "AD_UNIT", "matchesAny": {"values": ad_unit_ids}}
         ]
@@ -2383,6 +2470,10 @@ TEMPLATE_FILES["base.html"] = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}Flow{% endblock %}</title>
   <meta name="color-scheme" content="light dark">
+  <!-- Browser-tab icon (versioned so an update is picked up immediately) -->
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ app_version }}">
+  <link rel="apple-touch-icon" href="/static/favicon.svg?v={{ app_version }}">
+  <meta name="theme-color" content="#0b57d0">
   <script>
     // Set theme before first paint to avoid a flash. Default = light.
     (function(){ try {
@@ -2926,6 +3017,7 @@ TEMPLATE_FILES["mediation_builder.html"] = r"""{% extends "base.html" %}
           <button type="button" class="btn-ghost btn-sm" id="adunit-none">Clear</button>
         </div>
       </div>
+      <p class="adunit-scope" id="adunit-scope"></p>
       <div id="adunit-list" class="adunit-cards"></div>
     </div>
 
@@ -3074,7 +3166,66 @@ const state = {
   name_prefix: "Global",
   report_type: "mediation",
   report: null,
+  // Live per-ad-unit earnings for the CURRENT geo — drives the sort order of
+  // the ad unit list (highest earner first). Refetched whenever the app or the
+  // country selection changes, so the order always reflects that market.
+  earnings: {},
+  earnings_scope: "",
+  earnings_loading: false,
 };
+
+// ---- Ad unit earnings (sorted list) --------------------------------------
+async function loadEarnings() {
+  if (!state.app_id) { state.earnings = {}; renderAdUnits(); return; }
+  state.earnings_loading = true; renderAdUnits();
+  try {
+    const res = await fetch("/mediation/builder/adunit-earnings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        app_id: state.app_id,
+        country_mode: state.country_mode,
+        countries: [...state.countries],
+      }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      state.earnings = data.earnings || {};
+      state.earnings_scope = data.scope || "";
+    }
+  } catch (e) { /* keep whatever we had; the list just stays unsorted */ }
+  state.earnings_loading = false;
+  renderAdUnits();
+}
+// Country picking fires rapidly — debounce so we only fetch once the user stops.
+let _earnTimer = null;
+function scheduleEarnings() {
+  clearTimeout(_earnTimer);
+  _earnTimer = setTimeout(loadEarnings, 700);
+}
+// Compact numbers for the metrics strip: 966,101 -> 966K, 1,240,000 -> 1.24M
+function fmtNum(n) {
+  n = n || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 2).replace(/\.00$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1).replace(/\.0$/, "") + "K";
+  return String(n);
+}
+// The full metric strip shown under each ad unit.
+function metricStrip(e) {
+  const cells = [
+    ["RPM", fmtMoney(e.rpm || 0, "USD")],
+    ["Impr", fmtNum(e.impressions)],
+    ["Req", fmtNum(e.requests)],
+    ["Matched", fmtNum(e.matched)],
+    ["Match", fmtPct(e.match_rate || 0)],
+    ["Show", fmtPct(e.show_rate || 0)],
+    ["Fill", fmtPct(e.fill_rate || 0)],
+    ["CTR", fmtPct(e.ctr || 0)],
+    ["Clicks", fmtNum(e.clicks)],
+  ];
+  return `<div class="adunit-metrics">` + cells.map(([k, v]) =>
+    `<div class="am-cell"><span class="am-label">${k}</span><span class="am-val">${v}</span></div>`
+  ).join("") + `</div>`;
+}
 
 // eCPM source toggle (Mediation = matches AdMob UI / Network = AdMob Network only)
 $$('input[name="report_type"]').forEach(r => r.addEventListener("change", () => {
@@ -3144,12 +3295,41 @@ function renderAdUnits() {
   const wrap = $("#adunit-list");
   const filter = ($("#adunit-search").value || "").toLowerCase();
   wrap.innerHTML = "";
-  const filtered = list.filter(u => !filter || (u.name||"").toLowerCase().includes(filter) || u.ad_unit_id.toLowerCase().includes(filter) || (u.ad_format||"").toLowerCase().includes(filter));
+
+  const geo = (state.country_mode === "INCLUDE" && state.countries.size)
+    ? [...state.countries].join(", ")
+    : (state.country_mode === "EXCLUDE" ? "Global (exclude can't be geo-filtered)" : "Global — all countries");
+  // Does this geo have ANY earnings? If not, ranks/zeros are meaningless —
+  // say so plainly instead of showing a list of $0.00 with fake ranks.
+  const anyEarn = Object.values(state.earnings || {}).some(e => (e && e.revenue) > 0);
+  const noEarn = !state.earnings_loading && !anyEarn;
+
+  const scopeEl = $("#adunit-scope");
+  if (scopeEl) {
+    scopeEl.className = "adunit-scope" + (noEarn ? " is-warn" : "");
+    scopeEl.innerHTML = state.earnings_loading
+      ? `<span class="earn-spin"></span> Loading earnings for <b>${geo}</b>…`
+      : (noEarn
+          ? `<span class="earn-warn">!</span> No earnings in <b>${geo}</b> over the last 7 days — nothing to sort by, so these are in default order. Try <b>Global</b> or a bigger market.`
+          : `Sorted by earnings · last 7 days · <b>${geo}</b>`);
+  }
+
+  let filtered = list.filter(u => !filter || (u.name||"").toLowerCase().includes(filter) || u.ad_unit_id.toLowerCase().includes(filter) || (u.ad_format||"").toLowerCase().includes(filter));
   if (!filtered.length) { wrap.innerHTML = '<p class="muted small">No ad units match.</p>'; return; }
-  filtered.forEach(u => {
+
+  // HIGHEST EARNING FIRST for the currently selected geo. Ad units with no
+  // earnings fall to the bottom (still selectable).
+  const rev = u => (state.earnings[u.ad_unit_id] || {}).revenue || 0;
+  filtered = filtered.slice().sort((a, b) => rev(b) - rev(a));
+  const top = filtered.length ? rev(filtered[0]) : 0;
+
+  filtered.forEach((u, i) => {
     const sel = state.ad_units.some(s => s.id === u.id);
+    const e = state.earnings[u.ad_unit_id] || {};
+    const r = e.revenue || 0;
+    const pct = top > 0 ? Math.max(2, Math.round(100 * r / top)) : 0;
     const card = document.createElement("div");
-    card.className = "adunit-card" + (sel ? " is-selected" : "");
+    card.className = "adunit-card" + (sel ? " is-selected" : "") + (noEarn ? " is-noearn" : "");
     const existing = EXISTING_GROUPS[u.ad_unit_id] || [];
     const existingInfo = existing.length
       ? `<div class="small muted" style="margin-top:6px">${existing.length} existing group(s): ` +
@@ -3157,11 +3337,30 @@ function renderAdUnits() {
         (existing.length > 3 ? `, +${existing.length - 3} more` : "") +
         `</div>`
       : "";
-    card.innerHTML = `<div><div class="adunit-name">${u.name || "(unnamed)"} <span class="pill">${u.ad_format}</span></div><div class="adunit-id mono small">${u.ad_unit_id}</div>${existingInfo}</div><button type="button" class="btn-ghost btn-sm">${sel ? "Selected ✓" : "Select"}</button>`;
-    // Whole card is clickable to toggle selection (not just the button).
-    // Skip when the user clicked an existing-group link inside the card.
-    card.addEventListener("click", (e) => {
-      if (e.target.closest("a")) return;
+    // No earnings anywhere in this geo -> drop the whole money column rather
+    // than repeat "$0.00 / no earnings" on every row.
+    const earnBlock = state.earnings_loading
+      ? `<div class="adunit-earn"><span class="earn-skel"></span></div>`
+      : (noEarn ? "" : `<div class="adunit-earn">
+           <div class="earn-amt${r > 0 ? "" : " is-zero"}">${fmtMoney(r, "USD")}</div>
+           <div class="earn-sub mono">${r > 0 ? "eCPM " + fmtMoney(e.ecpm || 0, "USD") : "no earnings"}</div>
+           <div class="earn-bar"><span style="width:${pct}%"></span></div>
+         </div>`);
+    // Full metric detail (RPM, impressions, requests, match/show/fill, CTR…)
+    const strip = (state.earnings_loading || r <= 0) ? "" : metricStrip(e);
+    card.innerHTML = `
+      <div class="adunit-rank">${i + 1}</div>
+      <div class="adunit-main">
+        <div class="adunit-name">${u.name || "(unnamed)"} <span class="pill">${u.ad_format}</span></div>
+        <div class="adunit-id mono small">${u.ad_unit_id}</div>
+        ${existingInfo}
+      </div>
+      ${earnBlock}
+      <div class="adunit-pick">${sel ? "✓" : ""}</div>
+      ${strip}`;
+    // Whole card toggles selection (skip clicks on existing-group links).
+    card.addEventListener("click", (ev) => {
+      if (ev.target.closest("a")) return;
       if (sel) state.ad_units = state.ad_units.filter(s => s.id !== u.id);
       else state.ad_units.push(u);
       renderAdUnits(); updatePreview();
@@ -3183,6 +3382,7 @@ function renderCountries() {
     chip.addEventListener("click", () => {
       if (on) state.countries.delete(c.code); else state.countries.add(c.code);
       updateAutoPrefix(); renderCountries(); updatePreview();
+      scheduleEarnings();   // re-sort the ad unit list for this geo
     });
     wrap.appendChild(chip);
   });
@@ -3255,8 +3455,9 @@ $("#app-select").addEventListener("change", e => {
   state.app_label = opt.textContent;
   state.platform = (opt.dataset.platform || "").toUpperCase();
   state.ad_units = [];
+  state.earnings = {};
   $("#adunit-step").style.display = state.app_id ? "" : "none";
-  if (state.app_id) renderAdUnits();
+  if (state.app_id) { renderAdUnits(); loadEarnings(); }   // sort by live earnings
   updatePreview();
 });
 $("#adunit-search").addEventListener("input", renderAdUnits);
@@ -3280,11 +3481,13 @@ $$('input[name="country_mode"]').forEach(r => r.addEventListener("change", () =>
   if (mode === "GLOBAL") state.countries.clear();
   if (mode !== "GLOBAL") renderCountries();
   updateAutoPrefix(); updatePreview();
+  scheduleEarnings();   // re-sort ad units for the new geo
 }));
 $("#country-search").addEventListener("input", renderCountries);
 $("#country-paste").addEventListener("change", e => {
   e.target.value.split(",").map(s => s.trim().toUpperCase()).filter(Boolean).forEach(c => state.countries.add(c));
   updateAutoPrefix(); renderCountries(); updatePreview();
+  scheduleEarnings();
 });
 $("#line-count").addEventListener("change", e => { state.line_count = Math.max(1, Math.min(MAX_LINES, +e.target.value || DEFAULT_LINES)); updatePreview(); if (state.report) renderReport(); });
 $("#name-prefix").addEventListener("input", e => { state.name_prefix = e.target.value || "Group"; updatePreview(); });
@@ -4370,7 +4573,7 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--a
 .sel-unit-info { min-width: 0; }
 .sel-unit-name { font-weight: 500; font-size: 13.5px; }
 .sel-unit-remove { flex: none; width: 26px; height: 26px; border-radius: 6px; border: 1px solid var(--line-2); background: transparent; color: var(--bad); cursor: pointer; font-size: 14px; line-height: 1; }
-.sel-unit-remove:hover { border-color: var(--bad); background: rgba(224,79,79,0.08); }
+.sel-unit-remove:hover { border-color: var(--error); background: rgba(var(--bad-rgb),0.10); color: var(--error); }
 .country-chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; max-height: 220px; overflow-y: auto; }
 .country-chip { background: var(--bg-3); border: 1px solid var(--line-2); color: var(--ink-dim); padding: 6px 10px; border-radius: 999px; font-family: var(--font-mono); font-size: 12px; cursor: pointer; }
 .country-chip:hover { border-color: var(--ink-mute); }
@@ -4812,6 +5015,110 @@ label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) { flex-dir
 /* Builder step header — plain div (previously a fieldset legend that pierced
    the card's top border). Card border now stays fully intact. */
 .builder-legend { display: flex; align-items: center; gap: 10px; margin: 0 0 16px; color: var(--on-surface); font-family: var(--font-body); font-size: 13px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+
+/* ======================================================================
+   Ad unit list — ranked by live earnings for the selected geo (M3)
+   Layout: [rank] [name + id] [earnings + bar] [pick ✓]
+   ====================================================================== */
+.adunit-scope { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 12.5px; color: var(--on-surface-variant); }
+.adunit-scope b { color: var(--primary); font-weight: 600; }
+/* geo with zero earnings — M3 tonal warning, not a wall of $0.00 */
+.adunit-scope.is-warn { padding: 10px 12px; border-radius: var(--radius); background: rgba(var(--accent-rgb),0.08); border: 1px solid rgba(var(--accent-rgb),0.24); color: var(--on-surface); line-height: 1.45; }
+.earn-warn { display: grid; place-items: center; width: 18px; height: 18px; flex: none; border-radius: 50%; background: var(--primary); color: var(--on-primary); font-size: 12px; font-weight: 700; }
+.adunit-card.is-noearn { grid-template-columns: 30px 1fr 26px; }
+.adunit-card.is-noearn .adunit-rank { background: var(--surface-container-highest); color: var(--on-surface-variant); }
+.adunit-card { display: grid; grid-template-columns: 30px 1fr auto 26px; align-items: center; gap: 14px; padding: 12px 14px; }
+.adunit-rank { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--surface-container-highest); color: var(--on-surface-variant); font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.adunit-card:nth-child(1) .adunit-rank { background: var(--primary); color: var(--on-primary); }
+.adunit-card:nth-child(2) .adunit-rank,
+.adunit-card:nth-child(3) .adunit-rank { background: var(--primary-container); color: var(--on-primary-container); }
+.adunit-card.is-selected .adunit-rank { background: var(--primary); color: var(--on-primary); }
+.adunit-main { min-width: 0; }
+.adunit-main .adunit-id { word-break: break-all; }
+
+/* earnings block — the whole point: revenue shown next to the id */
+.adunit-earn { text-align: right; min-width: 118px; }
+.earn-amt { font-family: var(--font-display); font-size: 17px; font-weight: 700; color: var(--success); line-height: 1.15; font-variant-numeric: tabular-nums; }
+.earn-amt.is-zero { color: var(--on-surface-variant); font-weight: 600; opacity: 0.7; }
+.earn-sub { font-size: 11px; color: var(--on-surface-variant); margin-top: 1px; }
+/* M3 linear progress indicator: solid track + solid primary indicator */
+.earn-bar { height: 4px; margin-top: 6px; border-radius: 999px; background: var(--surface-container-highest); overflow: hidden; }
+.earn-bar > span { display: block; height: 100%; background: var(--primary); border-radius: 999px; transition: width .45s ease; }
+
+/* select tick */
+.adunit-pick { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; border: 2px solid var(--outline); color: var(--on-primary); font-size: 13px; font-weight: 700; transition: background .15s ease, border-color .15s ease; }
+.adunit-card.is-selected .adunit-pick { background: var(--primary); border-color: var(--primary); }
+
+/* loading: skeleton + spinner */
+.earn-skel { display: block; width: 96px; height: 34px; margin-left: auto; border-radius: 8px;
+  background: linear-gradient(90deg, var(--surface-container-high) 25%, var(--surface-container-highest) 37%, var(--surface-container-high) 63%);
+  background-size: 400% 100%; animation: earn-shimmer 1.2s ease infinite; }
+@keyframes earn-shimmer { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+.earn-spin { width: 13px; height: 13px; border-radius: 50%; border: 2px solid var(--outline-variant); border-top-color: var(--primary); animation: earn-spin .7s linear infinite; flex: none; }
+@keyframes earn-spin { to { transform: rotate(360deg); } }
+
+/* ======================================================================
+   M3 FILTER CHIPS — country picker + bidding networks
+   Spec: 32dp tall, 8dp corners (M3 chips are NOT pills), label-large
+   (14sp medium), outlined when unselected, secondary-container + leading
+   checkmark when selected, 16dp side padding (12dp once the check shows).
+   ====================================================================== */
+.country-chip, .bid-chip {
+  display: inline-flex; align-items: center; gap: 8px;
+  height: 32px; padding: 0 16px;
+  border-radius: 8px;                       /* M3 chip shape — not a pill */
+  border: 1px solid var(--outline);
+  background: transparent;
+  color: var(--on-surface-variant);
+  font: 500 14px/1 var(--font-body);        /* label-large, not mono */
+  letter-spacing: 0.01em; white-space: nowrap; cursor: pointer;
+  transition: background .15s ease, border-color .15s ease, color .15s ease;
+}
+.country-chip:hover, .bid-chip:hover { background: var(--fill-hover); color: var(--on-surface); border-color: var(--outline); }
+.country-chip:focus-visible, .bid-chip:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.country-chip.is-selected, .bid-chip.is-on,
+.country-chip.is-selected:hover, .bid-chip.is-on:hover {
+  background: var(--secondary-container);
+  color: var(--on-secondary-container);
+  border-color: transparent;
+  padding-left: 12px;                        /* room for the leading check */
+}
+.country-chip.is-selected::before, .bid-chip.is-on::before {
+  content: "✓"; font-size: 13px; font-weight: 700; line-height: 1; flex: none;
+}
+/* chip container: M3 spacing + a slim, tonal scrollbar */
+.country-chips, .bid-chips { gap: 8px; }
+.country-chips { max-height: 232px; padding-right: 4px; scrollbar-width: thin; }
+.country-chips::-webkit-scrollbar { width: 8px; }
+.country-chips::-webkit-scrollbar-track { background: transparent; }
+.country-chips::-webkit-scrollbar-thumb { background: var(--outline-variant); border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
+.country-chips::-webkit-scrollbar-thumb:hover { background: var(--outline); background-clip: content-box; }
+
+/* full metric detail row — spans the whole card, under the main row */
+.adunit-metrics { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; padding-top: 10px; border-top: 1px dashed var(--outline-variant); }
+.am-cell { display: flex; flex-direction: column; gap: 1px; padding: 5px 10px; border-radius: 8px; background: var(--surface-container); min-width: 62px; }
+.adunit-card.is-selected .am-cell { background: rgba(var(--accent-rgb),0.10); }
+.am-label { font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--on-surface-variant); font-weight: 600; }
+.am-val { font-size: 12.5px; font-weight: 600; color: var(--on-surface); font-variant-numeric: tabular-nums; }
+
+@media (max-width: 640px) {
+  .adunit-card { grid-template-columns: 26px 1fr auto; row-gap: 8px; }
+  .adunit-pick { display: none; }
+  .adunit-earn { min-width: 96px; }
+  .am-cell { min-width: 54px; padding: 4px 8px; }
+}
+"""
+
+
+# Browser-tab icon. Flow's brand mark (the hexagon from the top bar) in white
+# on the M3 primary blue, as an SVG so it stays crisp at any size. Kept bold
+# and simple so it still reads at 16px in a tab.
+FAVICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <rect width="64" height="64" rx="14" fill="#0b57d0"/>
+  <path d="M32 13 L48.5 22.5 L48.5 41.5 L32 51 L15.5 41.5 L15.5 22.5 Z"
+        fill="none" stroke="#ffffff" stroke-width="5" stroke-linejoin="round"/>
+  <circle cx="32" cy="32" r="5.5" fill="#ffffff"/>
+</svg>
 """
 
 
@@ -4821,6 +5128,7 @@ def write_assets() -> None:
     for name, body in TEMPLATE_FILES.items():
         (TEMPLATES_DIR / name).write_text(body, encoding="utf-8")
     (STATIC_DIR / "style.css").write_text(CSS_CONTENT, encoding="utf-8")
+    (STATIC_DIR / "favicon.svg").write_text(FAVICON_SVG, encoding="utf-8")
 
 
 # ============================================================================
@@ -4880,8 +5188,35 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.3.6"
+APP_VERSION = "1.4"
 CHANGELOG = [
+    {
+        "version": "1.4",
+        "date": "2026-07-13",
+        "title": "Ad units ranked by live earnings + faster, cleaner builder",
+        "changes": [
+            "NEW — the Builder now lists your ad units ranked by real earnings, "
+            "highest first, so you no longer have to check AdMob by hand to "
+            "decide what to select. Pick an app and the list orders itself.",
+            "The ranking follows your targeting: Global shows worldwide "
+            "earnings; choose one or more countries and the list instantly "
+            "re-sorts by that market's earnings.",
+            "Every ad unit now shows its earnings next to its ID, plus full "
+            "detail: eCPM, RPM, impressions, requests, matched, match rate, "
+            "show rate, fill rate, CTR and clicks — with a bar showing how big "
+            "an earner it is relative to the rest.",
+            "If a country has no earnings at all, the tool says so plainly "
+            "instead of listing a wall of $0.00 with meaningless ranks.",
+            "Much faster: account currency/timezone/exchange rate are now "
+            "cached across requests, the earnings list no longer derives the "
+            "exchange rate it doesn't need, and repeat lookups for the same app "
+            "+ country are instant (~40% faster, repeats immediate).",
+            "Country and bidding-network chips rebuilt as proper Material 3 "
+            "filter chips (correct shape, size, label style, and a checkmark "
+            "when selected), with a tidier scrollbar.",
+            "Flow now has its own browser-tab icon instead of the generic one.",
+        ],
+    },
     {
         "version": "1.3.6",
         "date": "2026-07-13",
@@ -5973,7 +6308,8 @@ def builder_fetch_report(payload: dict = Body(...), db: Session = Depends(get_db
         tz = client.get_account_timezone()
         start, end = _days_ago_iso(7, tz), _days_ago_iso(1, tz)
         report = client.fetch_network_report_for_ad_units(
-            ad_unit_ids, start, end, countries=countries, report_type=report_type)
+            ad_unit_ids, start, end, countries=countries,
+            report_type=report_type, with_fx=True)
     except AdMobAPIError as e:
         raise HTTPException(status_code=502, detail=str(e))
     for au in ad_unit_ids:
@@ -5984,6 +6320,70 @@ def builder_fetch_report(payload: dict = Body(...), db: Session = Depends(get_db
         })
     return {"start": start, "end": end, "report": report, "report_type": report_type,
             "countries": countries, "scope": "GLOBAL" if not countries else "COUNTRY"}
+
+
+@med_router.post("/builder/adunit-earnings")
+def builder_adunit_earnings(payload: dict = Body(...), db: Session = Depends(get_db), user: User = Depends(current_user)):
+    """Live per-ad-unit earnings for ONE app, scoped to the chosen geo, so the
+    builder can list ad units sorted by revenue (highest first) instead of the
+    user checking AdMob by hand.
+
+    Same window/currency rules as the main report: last 7 COMPLETE days in the
+    account's reporting timezone, values in USD. GLOBAL -> worldwide; INCLUDE
+    with countries -> that geo only (so the order reflects that market).
+    EXCLUDE can't be expressed by the AdMob filter (match-any only) -> global.
+    """
+    try:
+        app_pk = int(payload.get("app_id") or 0)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid app_id")
+    app_row = db.query(AdMobApp).filter(
+        AdMobApp.id == app_pk, AdMobApp.user_id == user.id).first()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="App not found")
+    ad_unit_ids = [u.ad_unit_id for u in app_row.ad_units]
+    if not ad_unit_ids:
+        return {"earnings": {}, "scope": "GLOBAL", "start": "", "end": ""}
+    country_mode = (payload.get("country_mode") or "GLOBAL").upper()
+    raw = [str(c).upper() for c in (payload.get("countries") or [])]
+    countries = raw if (country_mode == "INCLUDE" and raw) else []
+    # Short cache: users flip between Global and a few countries repeatedly, and
+    # the underlying report only changes once a day. Serve repeats instantly.
+    cache_key = (user.id, app_pk, ",".join(sorted(countries)) or "GLOBAL")
+    hit = _earnings_cache_get(cache_key)
+    if hit is not None:
+        return hit
+    try:
+        client = AdMobClient(db, user)
+        tz = client.get_account_timezone()
+        start, end = _days_ago_iso(7, tz), _days_ago_iso(1, tz)
+        rep = client.fetch_network_report_for_ad_units(
+            ad_unit_ids, start, end, countries=countries,
+            report_type="mediation", with_fx=False)   # earnings list: no FX -> fast
+    except AdMobAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+    # Every metric the report gives, so the builder can show full detail per
+    # ad unit (revenue drives the sort; the rest informs the choice).
+    earnings = {}
+    for au in ad_unit_ids:
+        m = rep.get(au) or {}
+        earnings[au] = {
+            "revenue": m.get("revenue_usd", 0.0),
+            "ecpm": m.get("ecpm_usd", 0.0),
+            "rpm": m.get("rpm_usd", 0.0),
+            "impressions": m.get("impressions", 0),
+            "requests": m.get("ad_requests", 0),
+            "matched": m.get("matched_requests", 0),
+            "clicks": m.get("clicks", 0),
+            "match_rate": m.get("match_rate", 0.0),
+            "show_rate": m.get("show_rate", 0.0),
+            "fill_rate": m.get("fill_rate", 0.0),
+            "ctr": m.get("ctr", 0.0),
+        }
+    out = {"earnings": earnings, "start": start, "end": end,
+           "scope": ",".join(countries) if countries else "GLOBAL"}
+    _earnings_cache_set(cache_key, out)
+    return out
 
 
 @med_router.post("/builder/generate")

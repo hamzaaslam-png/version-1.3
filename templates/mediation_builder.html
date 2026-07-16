@@ -40,6 +40,7 @@
           <button type="button" class="btn-ghost btn-sm" id="adunit-none">Clear</button>
         </div>
       </div>
+      <p class="adunit-scope" id="adunit-scope"></p>
       <div id="adunit-list" class="adunit-cards"></div>
     </div>
 
@@ -188,7 +189,66 @@ const state = {
   name_prefix: "Global",
   report_type: "mediation",
   report: null,
+  // Live per-ad-unit earnings for the CURRENT geo — drives the sort order of
+  // the ad unit list (highest earner first). Refetched whenever the app or the
+  // country selection changes, so the order always reflects that market.
+  earnings: {},
+  earnings_scope: "",
+  earnings_loading: false,
 };
+
+// ---- Ad unit earnings (sorted list) --------------------------------------
+async function loadEarnings() {
+  if (!state.app_id) { state.earnings = {}; renderAdUnits(); return; }
+  state.earnings_loading = true; renderAdUnits();
+  try {
+    const res = await fetch("/mediation/builder/adunit-earnings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        app_id: state.app_id,
+        country_mode: state.country_mode,
+        countries: [...state.countries],
+      }),
+    });
+    const data = await res.json();
+    if (res.ok) {
+      state.earnings = data.earnings || {};
+      state.earnings_scope = data.scope || "";
+    }
+  } catch (e) { /* keep whatever we had; the list just stays unsorted */ }
+  state.earnings_loading = false;
+  renderAdUnits();
+}
+// Country picking fires rapidly — debounce so we only fetch once the user stops.
+let _earnTimer = null;
+function scheduleEarnings() {
+  clearTimeout(_earnTimer);
+  _earnTimer = setTimeout(loadEarnings, 700);
+}
+// Compact numbers for the metrics strip: 966,101 -> 966K, 1,240,000 -> 1.24M
+function fmtNum(n) {
+  n = n || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 2).replace(/\.00$/, "") + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1).replace(/\.0$/, "") + "K";
+  return String(n);
+}
+// The full metric strip shown under each ad unit.
+function metricStrip(e) {
+  const cells = [
+    ["RPM", fmtMoney(e.rpm || 0, "USD")],
+    ["Impr", fmtNum(e.impressions)],
+    ["Req", fmtNum(e.requests)],
+    ["Matched", fmtNum(e.matched)],
+    ["Match", fmtPct(e.match_rate || 0)],
+    ["Show", fmtPct(e.show_rate || 0)],
+    ["Fill", fmtPct(e.fill_rate || 0)],
+    ["CTR", fmtPct(e.ctr || 0)],
+    ["Clicks", fmtNum(e.clicks)],
+  ];
+  return `<div class="adunit-metrics">` + cells.map(([k, v]) =>
+    `<div class="am-cell"><span class="am-label">${k}</span><span class="am-val">${v}</span></div>`
+  ).join("") + `</div>`;
+}
 
 // eCPM source toggle (Mediation = matches AdMob UI / Network = AdMob Network only)
 $$('input[name="report_type"]').forEach(r => r.addEventListener("change", () => {
@@ -258,12 +318,41 @@ function renderAdUnits() {
   const wrap = $("#adunit-list");
   const filter = ($("#adunit-search").value || "").toLowerCase();
   wrap.innerHTML = "";
-  const filtered = list.filter(u => !filter || (u.name||"").toLowerCase().includes(filter) || u.ad_unit_id.toLowerCase().includes(filter) || (u.ad_format||"").toLowerCase().includes(filter));
+
+  const geo = (state.country_mode === "INCLUDE" && state.countries.size)
+    ? [...state.countries].join(", ")
+    : (state.country_mode === "EXCLUDE" ? "Global (exclude can't be geo-filtered)" : "Global — all countries");
+  // Does this geo have ANY earnings? If not, ranks/zeros are meaningless —
+  // say so plainly instead of showing a list of $0.00 with fake ranks.
+  const anyEarn = Object.values(state.earnings || {}).some(e => (e && e.revenue) > 0);
+  const noEarn = !state.earnings_loading && !anyEarn;
+
+  const scopeEl = $("#adunit-scope");
+  if (scopeEl) {
+    scopeEl.className = "adunit-scope" + (noEarn ? " is-warn" : "");
+    scopeEl.innerHTML = state.earnings_loading
+      ? `<span class="earn-spin"></span> Loading earnings for <b>${geo}</b>…`
+      : (noEarn
+          ? `<span class="earn-warn">!</span> No earnings in <b>${geo}</b> over the last 7 days — nothing to sort by, so these are in default order. Try <b>Global</b> or a bigger market.`
+          : `Sorted by earnings · last 7 days · <b>${geo}</b>`);
+  }
+
+  let filtered = list.filter(u => !filter || (u.name||"").toLowerCase().includes(filter) || u.ad_unit_id.toLowerCase().includes(filter) || (u.ad_format||"").toLowerCase().includes(filter));
   if (!filtered.length) { wrap.innerHTML = '<p class="muted small">No ad units match.</p>'; return; }
-  filtered.forEach(u => {
+
+  // HIGHEST EARNING FIRST for the currently selected geo. Ad units with no
+  // earnings fall to the bottom (still selectable).
+  const rev = u => (state.earnings[u.ad_unit_id] || {}).revenue || 0;
+  filtered = filtered.slice().sort((a, b) => rev(b) - rev(a));
+  const top = filtered.length ? rev(filtered[0]) : 0;
+
+  filtered.forEach((u, i) => {
     const sel = state.ad_units.some(s => s.id === u.id);
+    const e = state.earnings[u.ad_unit_id] || {};
+    const r = e.revenue || 0;
+    const pct = top > 0 ? Math.max(2, Math.round(100 * r / top)) : 0;
     const card = document.createElement("div");
-    card.className = "adunit-card" + (sel ? " is-selected" : "");
+    card.className = "adunit-card" + (sel ? " is-selected" : "") + (noEarn ? " is-noearn" : "");
     const existing = EXISTING_GROUPS[u.ad_unit_id] || [];
     const existingInfo = existing.length
       ? `<div class="small muted" style="margin-top:6px">${existing.length} existing group(s): ` +
@@ -271,11 +360,30 @@ function renderAdUnits() {
         (existing.length > 3 ? `, +${existing.length - 3} more` : "") +
         `</div>`
       : "";
-    card.innerHTML = `<div><div class="adunit-name">${u.name || "(unnamed)"} <span class="pill">${u.ad_format}</span></div><div class="adunit-id mono small">${u.ad_unit_id}</div>${existingInfo}</div><button type="button" class="btn-ghost btn-sm">${sel ? "Selected ✓" : "Select"}</button>`;
-    // Whole card is clickable to toggle selection (not just the button).
-    // Skip when the user clicked an existing-group link inside the card.
-    card.addEventListener("click", (e) => {
-      if (e.target.closest("a")) return;
+    // No earnings anywhere in this geo -> drop the whole money column rather
+    // than repeat "$0.00 / no earnings" on every row.
+    const earnBlock = state.earnings_loading
+      ? `<div class="adunit-earn"><span class="earn-skel"></span></div>`
+      : (noEarn ? "" : `<div class="adunit-earn">
+           <div class="earn-amt${r > 0 ? "" : " is-zero"}">${fmtMoney(r, "USD")}</div>
+           <div class="earn-sub mono">${r > 0 ? "eCPM " + fmtMoney(e.ecpm || 0, "USD") : "no earnings"}</div>
+           <div class="earn-bar"><span style="width:${pct}%"></span></div>
+         </div>`);
+    // Full metric detail (RPM, impressions, requests, match/show/fill, CTR…)
+    const strip = (state.earnings_loading || r <= 0) ? "" : metricStrip(e);
+    card.innerHTML = `
+      <div class="adunit-rank">${i + 1}</div>
+      <div class="adunit-main">
+        <div class="adunit-name">${u.name || "(unnamed)"} <span class="pill">${u.ad_format}</span></div>
+        <div class="adunit-id mono small">${u.ad_unit_id}</div>
+        ${existingInfo}
+      </div>
+      ${earnBlock}
+      <div class="adunit-pick">${sel ? "✓" : ""}</div>
+      ${strip}`;
+    // Whole card toggles selection (skip clicks on existing-group links).
+    card.addEventListener("click", (ev) => {
+      if (ev.target.closest("a")) return;
       if (sel) state.ad_units = state.ad_units.filter(s => s.id !== u.id);
       else state.ad_units.push(u);
       renderAdUnits(); updatePreview();
@@ -297,6 +405,7 @@ function renderCountries() {
     chip.addEventListener("click", () => {
       if (on) state.countries.delete(c.code); else state.countries.add(c.code);
       updateAutoPrefix(); renderCountries(); updatePreview();
+      scheduleEarnings();   // re-sort the ad unit list for this geo
     });
     wrap.appendChild(chip);
   });
@@ -369,8 +478,9 @@ $("#app-select").addEventListener("change", e => {
   state.app_label = opt.textContent;
   state.platform = (opt.dataset.platform || "").toUpperCase();
   state.ad_units = [];
+  state.earnings = {};
   $("#adunit-step").style.display = state.app_id ? "" : "none";
-  if (state.app_id) renderAdUnits();
+  if (state.app_id) { renderAdUnits(); loadEarnings(); }   // sort by live earnings
   updatePreview();
 });
 $("#adunit-search").addEventListener("input", renderAdUnits);
@@ -394,11 +504,13 @@ $$('input[name="country_mode"]').forEach(r => r.addEventListener("change", () =>
   if (mode === "GLOBAL") state.countries.clear();
   if (mode !== "GLOBAL") renderCountries();
   updateAutoPrefix(); updatePreview();
+  scheduleEarnings();   // re-sort ad units for the new geo
 }));
 $("#country-search").addEventListener("input", renderCountries);
 $("#country-paste").addEventListener("change", e => {
   e.target.value.split(",").map(s => s.trim().toUpperCase()).filter(Boolean).forEach(c => state.countries.add(c));
   updateAutoPrefix(); renderCountries(); updatePreview();
+  scheduleEarnings();
 });
 $("#line-count").addEventListener("change", e => { state.line_count = Math.max(1, Math.min(MAX_LINES, +e.target.value || DEFAULT_LINES)); updatePreview(); if (state.report) renderReport(); });
 $("#name-prefix").addEventListener("input", e => { state.name_prefix = e.target.value || "Group"; updatePreview(); });

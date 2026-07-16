@@ -5,6 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>{% block title %}Flow{% endblock %}</title>
   <meta name="color-scheme" content="light dark">
+  <!-- Browser-tab icon (versioned so an update is picked up immediately) -->
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg?v={{ app_version }}">
+  <link rel="apple-touch-icon" href="/static/favicon.svg?v={{ app_version }}">
+  <meta name="theme-color" content="#0b57d0">
   <script>
     // Set theme before first paint to avoid a flash. Default = light.
     (function(){ try {
