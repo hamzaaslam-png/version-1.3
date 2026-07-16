@@ -3172,6 +3172,7 @@ const state = {
   earnings: {},
   earnings_scope: "",
   earnings_loading: false,
+  earnings_no_access: null,   // {app_publisher, signed_in_publisher} when set
 };
 
 // ---- Ad unit earnings (sorted list) --------------------------------------
@@ -3191,6 +3192,9 @@ async function loadEarnings() {
     if (res.ok) {
       state.earnings = data.earnings || {};
       state.earnings_scope = data.scope || "";
+      // This app belongs to an AdMob account the signed-in Google user can't
+      // query — say that, don't pretend the app earned nothing.
+      state.earnings_no_access = data.no_access ? data : null;
     }
   } catch (e) { /* keep whatever we had; the list just stays unsorted */ }
   state.earnings_loading = false;
@@ -3201,30 +3205,6 @@ let _earnTimer = null;
 function scheduleEarnings() {
   clearTimeout(_earnTimer);
   _earnTimer = setTimeout(loadEarnings, 700);
-}
-// Compact numbers for the metrics strip: 966,101 -> 966K, 1,240,000 -> 1.24M
-function fmtNum(n) {
-  n = n || 0;
-  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 2).replace(/\.00$/, "") + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1).replace(/\.0$/, "") + "K";
-  return String(n);
-}
-// The full metric strip shown under each ad unit.
-function metricStrip(e) {
-  const cells = [
-    ["RPM", fmtMoney(e.rpm || 0, "USD")],
-    ["Impr", fmtNum(e.impressions)],
-    ["Req", fmtNum(e.requests)],
-    ["Matched", fmtNum(e.matched)],
-    ["Match", fmtPct(e.match_rate || 0)],
-    ["Show", fmtPct(e.show_rate || 0)],
-    ["Fill", fmtPct(e.fill_rate || 0)],
-    ["CTR", fmtPct(e.ctr || 0)],
-    ["Clicks", fmtNum(e.clicks)],
-  ];
-  return `<div class="adunit-metrics">` + cells.map(([k, v]) =>
-    `<div class="am-cell"><span class="am-label">${k}</span><span class="am-val">${v}</span></div>`
-  ).join("") + `</div>`;
 }
 
 // eCPM source toggle (Mediation = matches AdMob UI / Network = AdMob Network only)
@@ -3302,16 +3282,31 @@ function renderAdUnits() {
   // Does this geo have ANY earnings? If not, ranks/zeros are meaningless —
   // say so plainly instead of showing a list of $0.00 with fake ranks.
   const anyEarn = Object.values(state.earnings || {}).some(e => (e && e.revenue) > 0);
+  const noAccess = !state.earnings_loading && !!state.earnings_no_access;
   const noEarn = !state.earnings_loading && !anyEarn;
 
   const scopeEl = $("#adunit-scope");
   if (scopeEl) {
-    scopeEl.className = "adunit-scope" + (noEarn ? " is-warn" : "");
-    scopeEl.innerHTML = state.earnings_loading
-      ? `<span class="earn-spin"></span> Loading earnings for <b>${geo}</b>…`
-      : (noEarn
-          ? `<span class="earn-warn">!</span> No earnings in <b>${geo}</b> over the last 7 days — nothing to sort by, so these are in default order. Try <b>Global</b> or a bigger market.`
-          : `Sorted by earnings · last 7 days · <b>${geo}</b>`);
+    // NOTE: the message body lives in ONE <span> — .adunit-scope is a flex row,
+    // so loose text/<b> nodes would each become a flex item and the sentence
+    // would break into scattered columns.
+    scopeEl.className = "adunit-scope" + ((noEarn || noAccess) ? " is-warn" : "");
+    let body;
+    if (state.earnings_loading) {
+      body = `<span class="earn-spin"></span><span class="scope-msg">Loading earnings for <b>${geo}</b>…</span>`;
+    } else if (noAccess) {
+      const a = state.earnings_no_access;
+      body = `<span class="earn-warn">!</span><span class="scope-msg">` +
+             `This app belongs to AdMob account <b>${a.app_publisher}</b>, but you're signed in as <b>${a.signed_in_publisher}</b> — ` +
+             `so earnings can't be loaded for it. Sign in with the Google account that owns <b>${a.app_publisher}</b> to see its data. ` +
+             `You can still select ad units and push (the push will fail for this account too).</span>`;
+    } else if (noEarn) {
+      body = `<span class="earn-warn">!</span><span class="scope-msg">` +
+             `No earnings in <b>${geo}</b> over the last 7 days — nothing to sort by, so these are in default order. Try <b>Global</b> or a bigger market.</span>`;
+    } else {
+      body = `<span class="scope-msg">Sorted by earnings · last 7 days · <b>${geo}</b></span>`;
+    }
+    scopeEl.innerHTML = body;
   }
 
   let filtered = list.filter(u => !filter || (u.name||"").toLowerCase().includes(filter) || u.ad_unit_id.toLowerCase().includes(filter) || (u.ad_format||"").toLowerCase().includes(filter));
@@ -3329,35 +3324,36 @@ function renderAdUnits() {
     const r = e.revenue || 0;
     const pct = top > 0 ? Math.max(2, Math.round(100 * r / top)) : 0;
     const card = document.createElement("div");
-    card.className = "adunit-card" + (sel ? " is-selected" : "") + (noEarn ? " is-noearn" : "");
+    card.className = "adunit-card" + (sel ? " is-selected" : "")
+      + (noAccess ? " is-noaccess" : (noEarn ? " is-noearn" : ""));
+    // Keep the row short: just a compact count instead of listing every
+    // existing group's name (that made the list very long).
     const existing = EXISTING_GROUPS[u.ad_unit_id] || [];
-    const existingInfo = existing.length
-      ? `<div class="small muted" style="margin-top:6px">${existing.length} existing group(s): ` +
-        existing.slice(0, 3).map(g => `<a href="/mediation/${g.id}" target="_blank">${g.name}</a>` + (g.admob_group_id ? ` <span class="pill pill-good">in AdMob</span>` : "")).join(", ") +
-        (existing.length > 3 ? `, +${existing.length - 3} more` : "") +
-        `</div>`
+    const existingBadge = existing.length
+      ? `<span class="pill pill-groups" title="${existing.length} existing mediation group(s) on this ad unit">${existing.length} group${existing.length > 1 ? "s" : ""}</span>`
       : "";
-    // No earnings anywhere in this geo -> drop the whole money column rather
-    // than repeat "$0.00 / no earnings" on every row.
+    // Money column:
+    //  - no ACCESS to this app's AdMob account -> say that (never "no earnings",
+    //    which would be a lie: we simply can't read this account's data)
+    //  - access fine but the geo earned nothing -> drop the column entirely
+    //    rather than repeat "$0.00 / no earnings" on every row
     const earnBlock = state.earnings_loading
       ? `<div class="adunit-earn"><span class="earn-skel"></span></div>`
-      : (noEarn ? "" : `<div class="adunit-earn">
+      : (noAccess
+          ? `<div class="adunit-earn"><span class="earn-noaccess" title="Your signed-in Google account can't read this AdMob account's data">⚠ Check AdMob access</span></div>`
+          : (noEarn ? "" : `<div class="adunit-earn">
            <div class="earn-amt${r > 0 ? "" : " is-zero"}">${fmtMoney(r, "USD")}</div>
            <div class="earn-sub mono">${r > 0 ? "eCPM " + fmtMoney(e.ecpm || 0, "USD") : "no earnings"}</div>
            <div class="earn-bar"><span style="width:${pct}%"></span></div>
-         </div>`);
-    // Full metric detail (RPM, impressions, requests, match/show/fill, CTR…)
-    const strip = (state.earnings_loading || r <= 0) ? "" : metricStrip(e);
+         </div>`));
     card.innerHTML = `
       <div class="adunit-rank">${i + 1}</div>
       <div class="adunit-main">
-        <div class="adunit-name">${u.name || "(unnamed)"} <span class="pill">${u.ad_format}</span></div>
+        <div class="adunit-name">${u.name || "(unnamed)"} <span class="pill">${u.ad_format}</span>${existingBadge}</div>
         <div class="adunit-id mono small">${u.ad_unit_id}</div>
-        ${existingInfo}
       </div>
       ${earnBlock}
-      <div class="adunit-pick">${sel ? "✓" : ""}</div>
-      ${strip}`;
+      <div class="adunit-pick">${sel ? "✓" : ""}</div>`;
     // Whole card toggles selection (skip clicks on existing-group links).
     card.addEventListener("click", (ev) => {
       if (ev.target.closest("a")) return;
@@ -3456,6 +3452,7 @@ $("#app-select").addEventListener("change", e => {
   state.platform = (opt.dataset.platform || "").toUpperCase();
   state.ad_units = [];
   state.earnings = {};
+  state.earnings_no_access = null;
   $("#adunit-step").style.display = state.app_id ? "" : "none";
   if (state.app_id) { renderAdUnits(); loadEarnings(); }   // sort by live earnings
   updatePreview();
@@ -5020,13 +5017,20 @@ label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) { flex-dir
    Ad unit list — ranked by live earnings for the selected geo (M3)
    Layout: [rank] [name + id] [earnings + bar] [pick ✓]
    ====================================================================== */
-.adunit-scope { display: flex; align-items: center; gap: 8px; margin: 0 0 12px; font-size: 12.5px; color: var(--on-surface-variant); }
+.adunit-scope { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 12px; font-size: 12.5px; color: var(--on-surface-variant); }
 .adunit-scope b { color: var(--primary); font-weight: 600; }
+/* the sentence must be ONE flex item, or each <b> becomes its own item and the
+   text scatters into columns */
+.scope-msg { flex: 1; min-width: 0; line-height: 1.5; }
+.earn-spin, .earn-warn { margin-top: 1px; }
 /* geo with zero earnings — M3 tonal warning, not a wall of $0.00 */
 .adunit-scope.is-warn { padding: 10px 12px; border-radius: var(--radius); background: rgba(var(--accent-rgb),0.08); border: 1px solid rgba(var(--accent-rgb),0.24); color: var(--on-surface); line-height: 1.45; }
 .earn-warn { display: grid; place-items: center; width: 18px; height: 18px; flex: none; border-radius: 50%; background: var(--primary); color: var(--on-primary); font-size: 12px; font-weight: 700; }
 .adunit-card.is-noearn { grid-template-columns: 30px 1fr 26px; }
-.adunit-card.is-noearn .adunit-rank { background: var(--surface-container-highest); color: var(--on-surface-variant); }
+.adunit-card.is-noearn .adunit-rank,
+.adunit-card.is-noaccess .adunit-rank { background: var(--surface-container-highest); color: var(--on-surface-variant); }
+/* can't read this app's AdMob account — M3 error tonal, not a fake "$0.00" */
+.earn-noaccess { display: inline-block; padding: 5px 10px; border-radius: 8px; background: var(--error-container); color: var(--on-error-container); font-size: 11px; font-weight: 700; white-space: nowrap; letter-spacing: 0.01em; }
 .adunit-card { display: grid; grid-template-columns: 30px 1fr auto 26px; align-items: center; gap: 14px; padding: 12px 14px; }
 .adunit-rank { display: grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--surface-container-highest); color: var(--on-surface-variant); font-size: 12px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .adunit-card:nth-child(1) .adunit-rank { background: var(--primary); color: var(--on-primary); }
@@ -5094,18 +5098,13 @@ label:has(> input[type="checkbox"]), label:has(> input[type="radio"]) { flex-dir
 .country-chips::-webkit-scrollbar-thumb { background: var(--outline-variant); border-radius: 999px; border: 2px solid transparent; background-clip: content-box; }
 .country-chips::-webkit-scrollbar-thumb:hover { background: var(--outline); background-clip: content-box; }
 
-/* full metric detail row — spans the whole card, under the main row */
-.adunit-metrics { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; padding-top: 10px; border-top: 1px dashed var(--outline-variant); }
-.am-cell { display: flex; flex-direction: column; gap: 1px; padding: 5px 10px; border-radius: 8px; background: var(--surface-container); min-width: 62px; }
-.adunit-card.is-selected .am-cell { background: rgba(var(--accent-rgb),0.10); }
-.am-label { font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--on-surface-variant); font-weight: 600; }
-.am-val { font-size: 12.5px; font-weight: 600; color: var(--on-surface); font-variant-numeric: tabular-nums; }
+/* compact "N groups" badge — replaces the long list of group names */
+.pill-groups { background: var(--surface-container-highest); color: var(--on-surface-variant); }
 
 @media (max-width: 640px) {
   .adunit-card { grid-template-columns: 26px 1fr auto; row-gap: 8px; }
   .adunit-pick { display: none; }
   .adunit-earn { min-width: 96px; }
-  .am-cell { min-width: 54px; padding: 4px 8px; }
 }
 """
 
@@ -5188,8 +5187,30 @@ BUILD_TAG = "waterfall-v1alpha-batchcreate-v13-aes256-security"
 # ============================================================================
 # VERSION + CHANGELOG  (shown in the footer; click the version for details)
 # ============================================================================
-APP_VERSION = "1.4"
+APP_VERSION = "1.4.1"
 CHANGELOG = [
+    {
+        "version": "1.4.1",
+        "date": "2026-07-13",
+        "title": "Clear 'no access' message + a much shorter ad unit list",
+        "changes": [
+            "If an app belongs to an AdMob account your signed-in Google account "
+            "can't read (e.g. it was synced from a different account), the tool "
+            "now says so — 'Check AdMob access', plus which account owns the app "
+            "and which one you're signed in as. Previously it wrongly showed 'no "
+            "earnings', which looked like the app had earned nothing.",
+            "That case is now detected from the app's own ID, so it's instant — "
+            "no more waiting on a request that was always going to come back "
+            "empty.",
+            "The ad unit list is much shorter: the per-row metric strip (RPM, "
+            "impressions, requests, match/show/fill, CTR, clicks) and the long "
+            "list of existing group names are gone. Each row now shows just the "
+            "essentials — rank, name, ad unit ID and earnings — with a small "
+            "'N groups' badge so you can still see an ad unit already has "
+            "mediation groups.",
+            "Fixed the notice above the list breaking into scattered columns.",
+        ],
+    },
     {
         "version": "1.4",
         "date": "2026-07-13",
@@ -6355,6 +6376,21 @@ def builder_adunit_earnings(payload: dict = Body(...), db: Session = Depends(get
         return hit
     try:
         client = AdMobClient(db, user)
+        # The signed-in Google account can only query ITS OWN AdMob publisher.
+        # Apps cached from a DIFFERENT account (synced when another account was
+        # connected) come back with an empty report — which looks like "no
+        # earnings" but really means "no access". Detect it up front from the
+        # app id's publisher so we can say so plainly (and skip a doomed call).
+        app_pub = _publisher_of_app_id(app_row.app_id)
+        token_pub = client.get_publisher_id()
+        if app_pub and token_pub and app_pub != token_pub:
+            return {
+                "earnings": {}, "start": "", "end": "",
+                "scope": ",".join(countries) if countries else "GLOBAL",
+                "no_access": True,
+                "app_publisher": app_pub,
+                "signed_in_publisher": token_pub,
+            }
         tz = client.get_account_timezone()
         start, end = _days_ago_iso(7, tz), _days_ago_iso(1, tz)
         rep = client.fetch_network_report_for_ad_units(
